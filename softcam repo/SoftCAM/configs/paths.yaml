@@ -1,0 +1,51 @@
+# contains the paths to the dataset
+
+Fundus:
+  dset_name: kaggle_512  
+  root: xxx 
+  data_dir: kaggle_data_512   
+  data_dir_slurm: train
+  target: "onset1" # onset1, onset2, level
+  fname:  "filename"
+  train_csv: './csv_files/kaggle/kaggle_gradable_train_reduce.csv'
+  val_csv: './csv_files/kaggle/kaggle_gradable_val.csv'
+  test_csv: './csv_files/kaggle/kaggle_gradable_test.csv'
+  mean: [0.41326871514320374, 0.2723627984523773, 0.18590997159481049] 
+  std: [0.29345420002937317, 0.20033970475196838, 0.15474912524223328] 
+  num_classes: 2 # number of classes [2, 5]
+  binary: True # [True, False] True => n_classe = 2, False => n_classe = 5
+  threshold: False # False 1 for onset1 and 2 for unset2. to derive the binary metrics~ used in the metrics file
+  input_size: 512 
+
+RSNA:
+  dset_name: RSNA  
+  root: xx 
+  data_dir: "png_images"
+  train_csv: './csv_files/RSNA/train.csv' 
+  val_csv: './csv_files/RSNA/val.csv'   
+  test_csv: './csv_files/RSNA/test.csv'
+  target: "bin_target"  
+  fname: 'filename' 
+  mean: [0.488974928855896, 0.488974928855896, 0.488974928855896] 
+  std: [0.2458493560552597, 0.2458493560552597, 0.2458493560552597]
+  num_classes: 2 # number of classes, default 100 [2, 5]
+  binary: True
+  threshold: False # False 1 for onset1 and 2 for unset2. to derive the binary metrics~ used in the metrics file
+  input_size: 512
+  
+  
+Retinal_OCT:
+  dset_name: OCT  
+  root: xx
+  data_dir: "OCT_preprocessed_resized_3_channels_496"
+  train_csv: './csv_files/Retinal_OCT/train.csv' 
+  val_csv: './csv_files/Retinal_OCT/val.csv'   
+  test_csv: './csv_files/Retinal_OCT/test.csv'
+  target: "drusen"  
+  fname: 'filename' 
+  mean: [0.19075624644756317, 0.19075624644756317, 0.19075624644756317] 
+  std: [0.22165445983409882, 0.22165445983409882, 0.22165445983409882]
+  num_classes: 2 # number of classes, default 100 [2, 5]
+  binary: True
+  threshold: False # False 1 for onset1 and 2 for unset2. to derive the binary metrics~ used in the metrics file
+  input_size: 496

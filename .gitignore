@@ -1,0 +1,74 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+*.whl
+
+# ===== Jupyter Notebook =====
+.ipynb_checkpoints/
+
+# ===== IDE / Editor =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ===== Data / Model Weights =====
+*.pth
+*.pt
+*.pkl
+*.h5
+*.hdf5
+*.ckpt
+*.onnx
+*.pb
+*.safetensors
+*.npy
+*.npz
+*.model
+*.weights
+
+# ===== Archives =====
+*.zip
+*.tar
+*.tar.gz
+*.gz
+*.bz2
+*.rar
+*.7z
+
+# ===== Experiment Outputs =====
+experiments_segrd_segmentation_out/
+
+# ===== Logs =====
+*.log
+logs/
+
+# ===== Virtual Environments =====
+venv/
+env/
+.env/
+.venv/
+
+# ===== Misc =====
+*.bak
+*.tmp
+
+
+unet repo\Beyond-Classification-Elaborating-Network-Predictions-for-Better-Weakly-Supervised-Quantization\demo_dir
+
