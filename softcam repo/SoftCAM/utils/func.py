@@ -50,18 +50,10 @@ def parse_config():
     return args
 
 def load_save_paths(cfg):
-    timestamp_str = datetime.now().strftime("%d-%m-%Y_%H:%M:%S")
-    # save path    
-    save_path_model = 'Outputs/tmp/FullyConvNet' if cfg.base.test else f'Outputs/FullyConvNet/{cfg.base.dataset}'
-
-    if 'gber' in socket.gethostname():         
-        save_path = os.path.join(os.path.expanduser('~'), save_path_model, timestamp_str) 
-    else:
-        save_p = '/mnt/qb/work/berens/kdjoumessi56'
-        save_path = os.path.join(save_p, save_path_model, timestamp_str) 
-        #raise NotImplementedError('Path on this server is not implemented.')
-    return save_path
-
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = getattr(cfg.dset, 'output_dir', None) or os.path.join(os.getcwd(), 'Outputs')
+    run_type = 'tmp' if getattr(cfg.base, 'test', False) else cfg.base.dataset
+    return os.path.join(output_dir, run_type, timestamp_str)
 def data_path(cfg, cfg_path):
     dset = cfg.base.dataset
     
@@ -79,14 +71,9 @@ def data_path(cfg, cfg_path):
     cfg.data['input_size'] = cfg_path[dset].input_size    
     cfg.data['num_classes'] = cfg_path[dset].num_classes 
     
-    if 'gber' in socket.gethostname():
-        cfg.dset['root'] = cfg_path[dset].root
-        cfg.dset['data_dir'] = cfg_path[dset].data_dir
-    else:
-        cfg.dset['root'] = cfg_path[dset].root_slurm
-        cfg.dset['data_dir'] = cfg_path[dset].data_dir_slurm
-        #NotImplementedError('Not yet implemented path to the dataset on the MLcloud')
-        #raise ValueError('Not implemented dataset.')
+    cfg.dset['root'] = cfg_path[dset].root
+    cfg.dset['data_dir'] = cfg_path[dset].data_dir
+    cfg.dset['output_dir'] = getattr(cfg_path[dset], 'output_dir', None)
     return cfg
 
 def load_config(args):
