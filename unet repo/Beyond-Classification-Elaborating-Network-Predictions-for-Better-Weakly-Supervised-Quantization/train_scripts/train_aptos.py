@@ -4,12 +4,12 @@ Chen's Unet (SegRDNet) APTOS 2019 Training Script
 Single-file entry point for 5-class DR classification on APTOS dataset.
 Uses existing SegRDNet model code from models/model_segrdnet.py
 """
+import os
 
 # Suppress CUDA driver warnings BEFORE importing torch
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-import os
 import sys
 import time
 import random
