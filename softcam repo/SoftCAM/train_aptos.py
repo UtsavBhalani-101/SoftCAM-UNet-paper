@@ -317,7 +317,9 @@ def generate_heatmaps(cfg, model, save_path, num_samples=20):
         print("Heatmaps only available with conv_cls=True")
         return
     
-    model.eval()
+    # Get underlying model if DataParallel
+    model_to_use = model.module if isinstance(model, nn.DataParallel) else model
+    model_to_use.eval()
     
     val_csv_path = os.path.join(cfg.data_dir, cfg.train_csv)
     val_img_dir = os.path.join(cfg.data_dir, cfg.train_img_dir)
@@ -339,7 +341,7 @@ def generate_heatmaps(cfg, model, save_path, num_samples=20):
         input_tensor = transform(image).unsqueeze(0).to(cfg.device)
         
         with torch.no_grad():
-            outputs, activations = model(input_tensor)
+            outputs, activations = model_to_use(input_tensor)
             probs = torch.softmax(outputs, dim=1)
             pred = torch.argmax(probs, dim=1).item()
         
@@ -364,7 +366,9 @@ def generate_heatmaps(cfg, model, save_path, num_samples=20):
 # SUBMISSION GENERATION
 # =============================================================================
 def generate_submission(cfg, model, save_path):
-    model.eval()
+    # Get underlying model if DataParallel
+    model_to_use = model.module if isinstance(model, nn.DataParallel) else model
+    model_to_use.eval()
     
     test_csv_path = os.path.join(cfg.data_dir, cfg.test_csv)
     test_img_dir = os.path.join(cfg.data_dir, cfg.test_img_dir)
@@ -379,7 +383,7 @@ def generate_submission(cfg, model, save_path):
     with torch.no_grad():
         for batch in test_loader:
             images = batch['image'].to(cfg.device)
-            outputs = model(images)
+            outputs = model_to_use(images)
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
             probs = torch.softmax(outputs, dim=1)
@@ -399,8 +403,9 @@ def generate_submission(cfg, model, save_path):
 # =============================================================================
 class Config:
     def __init__(self, args):
-        # Device detection
+        # Device detection - simple check
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
         
         # Data paths
         self.data_dir = args.data_dir
@@ -410,11 +415,11 @@ class Config:
         self.test_img_dir = args.test_img_dir
         self.img_size = args.img_size
         
-        # Training
-        self.batch_size = args.batch_size
-        self.val_batch_size = args.val_batch_size
-        self.num_workers = args.num_workers
-        self.persistent_workers = True if args.num_workers > 0 else False
+        # Training - scale batch size by num GPUs
+        self.batch_size = args.batch_size * max(1, self.num_gpus)
+        self.val_batch_size = args.val_batch_size * max(1, self.num_gpus)
+        self.num_workers = args.workers
+        self.persistent_workers = True if args.workers > 0 else False
         self.num_classes = args.num_classes
         
         # Model
@@ -514,13 +519,14 @@ def main():
     print("SOFTCAM APTOS TRAINING CONFIG")
     print("="*60)
     print(f"Device: {cfg.device}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    print(f"GPUs available: {cfg.num_gpus}")
+    if cfg.num_gpus > 0:
+        for i in range(cfg.num_gpus):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f} GB)")
     print(f"Network: {cfg.network}")
     print(f"Conv Classifier (heatmaps): {cfg.conv_cls}")
     print(f"Epochs: {cfg.epochs}")
-    print(f"Batch Size: {cfg.batch_size}")
+    print(f"Batch Size: {cfg.batch_size} (per GPU: {args.batch_size})")
     print(f"Workers: {cfg.num_workers} (persistent: {cfg.persistent_workers})")
     print(f"Loss: {cfg.loss}")
     print(f"MixUp: {cfg.mixup}, CutMix: {cfg.cutmix}")
@@ -575,6 +581,12 @@ def main():
     # Model
     model = generate_model(cfg)
     model.to(cfg.device)
+    
+    # Multi-GPU: wrap with DataParallel
+    if cfg.num_gpus > 1:
+        print(f"Using DataParallel on {cfg.num_gpus} GPUs")
+        model = nn.DataParallel(model)
+    
     print(f'Model: {cfg.network}, Parameters: {sum(p.numel() for p in model.parameters()):,}')
     
     # Loss, Optimizer, Scheduler
@@ -630,15 +642,34 @@ def main():
     print(f'Best validation QWK: {best_metric:.4f} at epoch {best_epoch}')
     print(f'{"="*60}')
     
+    # Load best model for final evaluation
+    best_model_path = os.path.join(save_path, 'best_model.pt')
+    state_dict = torch.load(best_model_path, map_location=cfg.device)
+    
+    # Handle DataParallel state dict
+    if cfg.num_gpus > 1 and not isinstance(model, nn.DataParallel):
+        # Model wasn't wrapped but state dict has module. prefix
+        model = nn.DataParallel(model)
+        model.load_state_dict(state_dict)
+    elif cfg.num_gpus == 1 and isinstance(model, nn.DataParallel):
+        # Model was wrapped but now single GPU
+        model.module.load_state_dict(state_dict)
+    else:
+        model.load_state_dict(state_dict)
+    
+    # Final validation with best model
+    print('\n=== Final Evaluation (Best Model) ===')
+    final_metrics = evaluate(cfg, model, val_loader, criterion)
+    print(f"FINAL: QWK={final_metrics['qwk']:.4f}, Acc={final_metrics['accuracy']:.4f}, AUC={final_metrics['auc_macro']:.4f}")
+    print(f"Confusion Matrix:\n{final_metrics['confusion_matrix']}")
+    
     # Generate heatmaps with best model
     if args.generate_heatmaps:
         print('\nGenerating heatmaps...')
-        model.load_state_dict(torch.load(os.path.join(save_path, 'best_model.pt')))
         generate_heatmaps(cfg, model, save_path, num_samples=20)
     
     # Generate submission
     print('\nGenerating submission...')
-    model.load_state_dict(torch.load(os.path.join(save_path, 'best_model.pt')))
     generate_submission(cfg, model, save_path)
     
     logger.close()
