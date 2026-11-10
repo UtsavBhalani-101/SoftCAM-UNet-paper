@@ -165,16 +165,22 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
         
         # Backward
         if loss_scaler is not None:
-            loss_scaler(loss, optimizer, clip_grad=cfg.grad_clip, clip_mode='norm',
-                       parameters=model.parameters(), create_graph=False, need_update=True)
+            loss_scaler.scale(loss).backward()
         else:
             loss.backward()
         
         # Step optimizer only every grad_accum_steps
         if (batch_idx + 1) % grad_accum_steps == 0:
-            if loss_scaler is None and cfg.grad_clip:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            optimizer.step()
+            if loss_scaler is not None:
+                if cfg.grad_clip:
+                    loss_scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                loss_scaler.step(optimizer)
+                loss_scaler.update()
+            else:
+                if cfg.grad_clip:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                optimizer.step()
             optimizer.zero_grad()
         
         # Use unscaled loss for logging
@@ -188,9 +194,16 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
     
     # Handle remaining gradients
     if (len(loader) % grad_accum_steps) != 0:
-        if loss_scaler is None and cfg.grad_clip:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        optimizer.step()
+        if loss_scaler is not None:
+            if cfg.grad_clip:
+                loss_scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            loss_scaler.step(optimizer)
+            loss_scaler.update()
+        else:
+            if cfg.grad_clip:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            optimizer.step()
         optimizer.zero_grad()
     
     avg_loss = losses_m / max(1, num_batches)
@@ -203,7 +216,7 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
     print(f"  Train: Loss={metrics['loss']:.4f}, QWK={metrics['qwk']:.4f}, Acc={metrics['accuracy']:.4f}, AUC={metrics['auc_macro']:.4f}")
     print(f"  AUC per class: {metrics['auc_per_class']}")
     
-    if lr_scheduler is not None:
+    if lr_scheduler is not None and not isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
         lr_scheduler.step()
     
     return metrics
