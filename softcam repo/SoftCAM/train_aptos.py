@@ -5,6 +5,10 @@ Single-file entry point for 5-class DR classification on APTOS dataset.
 Uses existing SoftCAM model code (FullyConvModel, ConvClassifier, losses).
 """
 
+# Suppress CUDA driver warnings BEFORE importing torch
+os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow/absl logs
+
 import os
 import sys
 import time
@@ -441,6 +445,26 @@ class Config:
         # Output
         self.save_path = args.output
         self.generate_heatmaps = args.generate_heatmaps
+        
+        # ============================================================
+        # COMPATIBILITY LAYER for original SoftCAM modules
+        # They expect: cfg.train.network, cfg.data.num_classes, etc.
+        # ============================================================
+        class TrainConfig:
+            def __init__(self, cfg):
+                self.network = cfg.network
+                self.pretrained = cfg.pretrained
+                self.conv_cls = cfg.conv_cls
+                self.loss = cfg.loss
+        
+        class DataConfig:
+            def __init__(self, cfg):
+                self.num_classes = cfg.num_classes
+                self.img_size = cfg.img_size
+                self.batch_size = cfg.batch_size
+        
+        self.train = TrainConfig(self)
+        self.data = DataConfig(self)
 
 
 def set_random_seed(seed):
@@ -514,15 +538,14 @@ def main():
     args = parse_args()
     cfg = Config(args)
     
-    # Print config
+    # Print config - NO driver detection, just is_available
     print("="*60)
     print("SOFTCAM APTOS TRAINING CONFIG")
     print("="*60)
     print(f"Device: {cfg.device}")
     print(f"GPUs available: {cfg.num_gpus}")
     if cfg.num_gpus > 0:
-        for i in range(cfg.num_gpus):
-            print(f"  GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f} GB)")
+        print(f"  Using {cfg.num_gpus} GPU(s)")
     print(f"Network: {cfg.network}")
     print(f"Conv Classifier (heatmaps): {cfg.conv_cls}")
     print(f"Epochs: {cfg.epochs}")
