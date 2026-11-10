@@ -74,3 +74,4 @@ unet repo\Beyond-Classification-Elaborating-Network-Predictions-for-Better-Weakl
 
 requirements_aptos.txt
 softcam repo/SoftCAM/softcam.md
+unet repo/Beyond-Classification-Elaborating-Network-Predictions-for-Better-Weakly-Supervised-Quantization/unet.md

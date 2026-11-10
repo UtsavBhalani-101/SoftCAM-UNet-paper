@@ -142,6 +142,18 @@ class LOG_SUM_EXP(nn.Module):
         return final
 
 
+class AVG_POOL(nn.Module):
+    """Average pooling replacement for LOG_SUM_EXP"""
+    def __init__(self, num_classes: int = 6):
+        super().__init__()
+        self.num_classes = num_classes
+        self.check = nn.Identity()
+    def forward(self, x):
+        # x: (B, C, H, W) -> (B, C)
+        x = self.check(x)
+        return F.adaptive_avg_pool2d(x, (1, 1)).flatten(1)
+
+
 
 
 
@@ -152,6 +164,7 @@ class RDNetClassifierHead(nn.Module):
         num_classes: int,
         drop_rate: float = 0.,
         akorn_on: bool = False,
+        pooling: str = 'avg',  # 'lse' or 'avg'
     ):
         super().__init__()
         self.in_features = in_features
@@ -164,11 +177,18 @@ class RDNetClassifierHead(nn.Module):
 
         self.se = EffectiveSEModule(in_features)
         self.r = 3
-        self.wt_exp = LOG_SUM_EXP(r= self.r)
+        
+        # Pooling selection
+        if pooling == 'lse':
+            self.wt_exp = LOG_SUM_EXP(r=self.r)
+        else:  # 'avg'
+            self.wt_exp = AVG_POOL(num_classes)
 
-        print('r value:', self.r, 'use avg')
+        print(f'Pooling: {pooling}')
     def reset(self, num_classes):
         self.fc = nn.Conv2d(self.num_features, num_classes, 1, padding = 0) if num_classes > 0 else nn.Identity()   
+        if hasattr(self.wt_exp, 'num_classes'):
+            self.wt_exp.num_classes = num_classes
 
     def feature(self, x):
         x = self.prenorm(x)
@@ -192,7 +212,8 @@ class SegRDNet(nn.Module):
         self,
         embedding_dim = 1024,
         num_classes = 6,
-        init_checkpoint = False
+        init_checkpoint = False,
+        pooling: str = 'avg',  # 'lse' or 'avg'
     ):
         super().__init__()
 
@@ -203,16 +224,23 @@ class SegRDNet(nn.Module):
         if init_checkpoint:
             self.init_checkpoint()
         ch_list = [1040,744,440,256]
-        self.head = RDNetClassifierHead(embedding_dim, num_classes)
+        self.head = RDNetClassifierHead(embedding_dim, num_classes, pooling=pooling)
         self.fc0 = nn.Conv2d(ch_list[0], num_classes,1,padding=0) 
         self.fc1 = nn.Conv2d(ch_list[1], num_classes,1,padding=0) 
         self.fc2 = nn.Conv2d(ch_list[2], num_classes,1,padding=0) 
         self.fc3 = nn.Conv2d(ch_list[3], num_classes,1,padding=0) 
         
-        self.lse0 = LOG_SUM_EXP(num_classes)
-        self.lse1 = LOG_SUM_EXP(num_classes)
-        self.lse2 = LOG_SUM_EXP(num_classes)
-        self.lse3 = LOG_SUM_EXP(num_classes)
+        # Pooling selection for multi-scale outputs
+        if pooling == 'lse':
+            self.lse0 = LOG_SUM_EXP(num_classes)
+            self.lse1 = LOG_SUM_EXP(num_classes)
+            self.lse2 = LOG_SUM_EXP(num_classes)
+            self.lse3 = LOG_SUM_EXP(num_classes)
+        else:  # 'avg'
+            self.lse0 = AVG_POOL(num_classes)
+            self.lse1 = AVG_POOL(num_classes)
+            self.lse2 = AVG_POOL(num_classes)
+            self.lse3 = AVG_POOL(num_classes)
 
         self.seq0 = nn.Sequential(EffectiveSEModule(ch_list[0])) 
         self.up0 = nn.Sequential(nn.Conv2d(ch_list[0], ch_list[1],1,padding=0),DepthToSpace2DWithConv(ch_list[1], 2, 2),LayerNormChan(ch_list[1], data_format="channels_first"))
