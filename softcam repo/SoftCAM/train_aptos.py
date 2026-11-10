@@ -5,11 +5,11 @@ Single-file entry point for 5-class DR classification on APTOS dataset.
 Uses existing SoftCAM model code (FullyConvModel, ConvClassifier, losses).
 """
 
+import os
 # Suppress CUDA driver warnings BEFORE importing torch
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow/absl logs
 
-import os
 import sys
 import time
 import random
