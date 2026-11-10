@@ -279,9 +279,9 @@ class Config:
         self.test_img_dir = args.test_img_dir
         self.img_size = args.img_size
         
-        # Training - scale batch size by num GPUs
-        self.batch_size = args.batch_size * max(1, self.num_gpus)
-        self.val_batch_size = args.val_batch_size * max(1, self.num_gpus)
+        # Training - single GPU for SegRDNet (hooks incompatible with DataParallel)
+        self.batch_size = args.batch_size
+        self.val_batch_size = args.val_batch_size
         self.num_workers = args.workers
         self.persistent_workers = True if args.workers > 0 else False
         self.num_classes = args.num_classes
@@ -375,9 +375,9 @@ def main():
     print(f"Device: {cfg.device}")
     print(f"GPUs available: {cfg.num_gpus}")
     if cfg.num_gpus > 0:
-        print(f"  Using {cfg.num_gpus} GPU(s)")
+        print(f"  Using single GPU (cuda:0) - SegRDNet hooks incompatible with DataParallel")
     print(f"Epochs: {cfg.epochs}")
-    print(f"Batch Size: {cfg.batch_size} (per GPU: {args.batch_size})")
+    print(f"Batch Size: {cfg.batch_size}")
     print(f"Workers: {cfg.num_workers} (persistent: {cfg.persistent_workers})")
     print(f"Loss: CrossEntropy (label_smoothing={cfg.label_smoothing})")
     print(f"Output: {cfg.save_path}")
@@ -436,10 +436,13 @@ def main():
     model = SegRDNet(num_classes=cfg.num_classes)
     model.to(cfg.device)
     
-    # Multi-GPU: wrap with DataParallel
+    # NOTE: SegRDNet uses forward hooks for multi-scale feature extraction
+    # which are incompatible with nn.DataParallel.
+    # Use single GPU (will use GPU 0). For multi-GPU, consider DDP instead.
     if cfg.num_gpus > 1:
-        print(f"Using DataParallel on {cfg.num_gpus} GPUs")
-        model = nn.DataParallel(model)
+        print(f"Multiple GPUs detected ({cfg.num_gpus}), but SegRDNet uses forward hooks")
+        print("  incompatible with DataParallel. Using single GPU (cuda:0).")
+        print("  For multi-GPU training, use DistributedDataParallel (DDP) instead.")
     
     print(f'Model: SegRDNet, Parameters: {sum(p.numel() for p in model.parameters()):,}')
     
