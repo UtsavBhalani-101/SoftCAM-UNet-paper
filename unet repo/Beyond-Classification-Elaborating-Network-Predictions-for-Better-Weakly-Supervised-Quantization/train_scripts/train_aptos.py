@@ -149,6 +149,8 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
     model.train()
     optimizer.zero_grad()
     
+    grad_accum_steps = getattr(cfg, 'grad_accum_steps', 1)
+    
     for batch_idx, (input, target) in enumerate(loader):
         input = input.to(device)
         target = target.to(device)
@@ -158,25 +160,38 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
             output = model(input)
             loss = loss_fn(output, target)
         
+        # Scale loss for gradient accumulation
+        loss = loss / grad_accum_steps
+        
         # Backward
         if loss_scaler is not None:
             loss_scaler(loss, optimizer, clip_grad=cfg.grad_clip, clip_mode='norm',
                        parameters=model.parameters(), create_graph=False, need_update=True)
         else:
             loss.backward()
-            if cfg.grad_clip:
+        
+        # Step optimizer only every grad_accum_steps
+        if (batch_idx + 1) % grad_accum_steps == 0:
+            if loss_scaler is None and cfg.grad_clip:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
+            optimizer.zero_grad()
         
-        optimizer.zero_grad()
-        
-        losses_m += loss.item()
+        # Use unscaled loss for logging
+        losses_m += loss.item() * grad_accum_steps
         num_batches += 1
         all_predictions.append(output.detach())
         all_targets.append(target.detach())
         
         if batch_idx % cfg.log_interval == 0:
-            print(f'Epoch {epoch} [{batch_idx}/{len(loader)}] Loss: {loss.item():.4f}')
+            print(f'Epoch {epoch} [{batch_idx}/{len(loader)}] Loss: {loss.item() * grad_accum_steps:.4f}')
+    
+    # Handle remaining gradients
+    if (len(loader) % grad_accum_steps) != 0:
+        if loss_scaler is None and cfg.grad_clip:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        optimizer.step()
+        optimizer.zero_grad()
     
     avg_loss = losses_m / max(1, num_batches)
     p_test = torch.cat(all_predictions, dim=0)
@@ -280,8 +295,12 @@ class Config:
         self.img_size = args.img_size
         
         # Training - single GPU for SegRDNet (hooks incompatible with DataParallel)
-        self.batch_size = args.batch_size
-        self.val_batch_size = args.val_batch_size
+        # Reduced batch size for 512x512 on T4 16GB
+        self.batch_size = min(args.batch_size, 8)
+        self.val_batch_size = min(args.val_batch_size, 16)
+        
+        # Gradient accumulation to maintain effective batch size
+        self.grad_accum_steps = max(1, args.batch_size // self.batch_size)
         self.num_workers = args.workers
         self.persistent_workers = True if args.workers > 0 else False
         self.num_classes = args.num_classes
@@ -377,7 +396,7 @@ def main():
     if cfg.num_gpus > 0:
         print(f"  Using single GPU (cuda:0) - SegRDNet hooks incompatible with DataParallel")
     print(f"Epochs: {cfg.epochs}")
-    print(f"Batch Size: {cfg.batch_size}")
+    print(f"Batch Size: {cfg.batch_size} (effective: {cfg.batch_size * getattr(cfg, 'grad_accum_steps', 1)} with grad_accum={getattr(cfg, 'grad_accum_steps', 1)})")
     print(f"Workers: {cfg.num_workers} (persistent: {cfg.persistent_workers})")
     print(f"Loss: CrossEntropy (label_smoothing={cfg.label_smoothing})")
     print(f"Output: {cfg.save_path}")
