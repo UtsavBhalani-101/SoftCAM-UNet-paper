@@ -101,43 +101,43 @@ def generate_model(cfg):
     # Load backbone from torchvision
     if network == 'resnet50':
         model = models.resnet50(pretrained=pretrained)
-        model.fc = nn.Identity()
-        num_ftrs = 2048
+        num_ftrs = model.fc.in_features
     elif network == 'resnet101':
         model = models.resnet101(pretrained=pretrained)
-        model.fc = nn.Identity()
-        num_ftrs = 2048
+        num_ftrs = model.fc.in_features
     elif network == 'resnet152':
         model = models.resnet152(pretrained=pretrained)
-        model.fc = nn.Identity()
-        num_ftrs = 2048
+        num_ftrs = model.fc.in_features
     elif network == 'densenet121':
         model = models.densenet121(pretrained=pretrained)
-        model.classifier = nn.Identity()
-        num_ftrs = 1024
+        num_ftrs = model.classifier.in_features
     elif network == 'densenet169':
         model = models.densenet169(pretrained=pretrained)
-        model.classifier = nn.Identity()
-        num_ftrs = 1664
+        num_ftrs = model.classifier.in_features
     elif network == 'efficientnet_b0':
         model = models.efficientnet_b0(pretrained=pretrained)
-        model.classifier = nn.Identity()
-        num_ftrs = 1280
+        num_ftrs = model.classifier[-1].in_features
     elif network == 'efficientnet_b3':
         model = models.efficientnet_b3(pretrained=pretrained)
-        model.classifier = nn.Identity()
-        num_ftrs = 1536
+        num_ftrs = model.classifier[-1].in_features
     elif network == 'bagnet33':
         print("BagNet not available, using resnet50")
         model = models.resnet50(pretrained=pretrained)
-        model.fc = nn.Identity()
-        num_ftrs = 2048
+        num_ftrs = model.fc.in_features
     else:
         raise ValueError(f'Unknown network: {network}')
     
     if cfg.conv_cls:
+        # FullyConvModel expects model with fc/classifier intact (it removes them internally)
         model = FullyConvModel(cfg, model, num_classes)
     else:
+        # Remove classifier and add our own
+        if 'resnet' in network or 'bagnet' in network:
+            model.fc = nn.Identity()
+        elif 'densenet' in network:
+            model.classifier = nn.Identity()
+        elif 'efficientnet' in network:
+            model.classifier = nn.Identity()
         classifier = nn.Linear(num_ftrs, num_classes)
         model = nn.Sequential(model, classifier)
     
