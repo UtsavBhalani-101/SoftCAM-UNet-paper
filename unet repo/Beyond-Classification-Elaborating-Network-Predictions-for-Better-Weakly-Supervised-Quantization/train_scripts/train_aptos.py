@@ -286,8 +286,7 @@ class Config:
         self.persistent_workers = True if args.workers > 0 else False
         self.num_classes = args.num_classes
         
-        # Model
-        self.network = args.network
+        # Model (fixed: SegRDNet with RDNet Tiny backbone)
         self.epochs = args.epochs
         self.lr = args.lr
         self.weight_decay = args.weight_decay
