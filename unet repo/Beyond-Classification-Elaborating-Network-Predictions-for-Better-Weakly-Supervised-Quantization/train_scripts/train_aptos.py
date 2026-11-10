@@ -434,6 +434,21 @@ def main():
     
     # Model
     model = SegRDNet(num_classes=cfg.num_classes)
+    
+    # Fix LOG_SUM_EXP bias size (original defaults to 6 classes for ICH)
+    # Reinitialize all LOG_SUM_EXP modules with correct num_classes
+    from models.model_segrdnet import LOG_SUM_EXP
+    for name, module in model.named_modules():
+        if isinstance(module, LOG_SUM_EXP):
+            # Replace with correctly sized LOG_SUM_EXP
+            parent_name = '.'.join(name.split('.')[:-1])
+            child_name = name.split('.')[-1]
+            if parent_name:
+                parent = model.get_submodule(parent_name)
+                setattr(parent, child_name, LOG_SUM_EXP(num_classes=cfg.num_classes))
+            else:
+                setattr(model, child_name, LOG_SUM_EXP(num_classes=cfg.num_classes))
+    
     model.to(cfg.device)
     
     # NOTE: SegRDNet uses forward hooks for multi-scale feature extraction
