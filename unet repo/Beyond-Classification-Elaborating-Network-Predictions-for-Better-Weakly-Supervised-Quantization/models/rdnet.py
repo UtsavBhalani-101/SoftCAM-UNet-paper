@@ -361,7 +361,7 @@ def rdnet_tiny(pretrained=True, **kwargs):
         "transition_compression_ratio": 0.5,
         "block_type": ["Block"] + ["Block"] + ["BlockESE"] * 4 + ["BlockESE"],
     }
-    model = _create_rdnet("rdnet_tiny", pretrained=True, **dict(model_args, **kwargs))
+    model = _create_rdnet("rdnet_tiny", pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
 

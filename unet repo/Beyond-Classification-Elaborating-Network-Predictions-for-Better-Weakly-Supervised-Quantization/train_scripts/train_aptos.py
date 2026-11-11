@@ -347,6 +347,7 @@ class Config:
         
         # Option A: SoftCAM Decoder 0
         self.use_softcam_decoder0 = args.use_softcam_decoder0
+        self.softcam_decoder0_mode = args.softcam_decoder0_mode
         self.softcam_lambda_l1 = args.softcam_lambda_l1
         self.softcam_lambda_l2 = args.softcam_lambda_l2
         self.softcam_aux_weight = args.softcam_aux_weight
@@ -410,6 +411,7 @@ def parse_args():
     
     # Option A: SoftCAM Decoder 0
     parser.add_argument('--use-softcam-decoder0', action='store_true', default=False, help='Enable SoftCAM evidence head for Decoder 0')
+    parser.add_argument('--softcam-decoder0-mode', choices=['a', 'b'], default='a', help='A: SoftCAM head only; B: add feature refinement before the SoftCAM head')
     parser.add_argument('--softcam-lambda-l1', default=0.0, type=float, help='L1 regularization weight for SoftCAM evidence maps')
     parser.add_argument('--softcam-lambda-l2', default=0.0, type=float, help='L2 regularization weight for SoftCAM evidence maps')
     parser.add_argument('--softcam-aux-weight', default=0.25, type=float, help='Weight for Decoder 0 SoftCAM classification loss')
@@ -444,7 +446,7 @@ def main():
     
     # Option A: SoftCAM Decoder 0
     if cfg.use_softcam_decoder0:
-        print(f"SoftCAM Decoder 0: ENABLED")
+        print(f"SoftCAM Decoder 0: ENABLED (Option {cfg.softcam_decoder0_mode.upper()})")
         print(f"  L1 lambda: {cfg.softcam_lambda_l1}")
         print(f"  L2 lambda: {cfg.softcam_lambda_l2}")
     else:
@@ -507,6 +509,7 @@ def main():
         num_classes=cfg.num_classes, 
         pooling='avg',
         use_softcam_decoder0=cfg.use_softcam_decoder0,
+        softcam_decoder0_mode=cfg.softcam_decoder0_mode,
         softcam_lambda_l1=cfg.softcam_lambda_l1,
         softcam_lambda_l2=cfg.softcam_lambda_l2
     )

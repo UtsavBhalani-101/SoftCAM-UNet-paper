@@ -202,6 +202,23 @@ class SoftCAMHead(nn.Module):
         return lambda_l1 * l1_loss + lambda_l2 * l2_loss
 
 
+class SoftCAMFeatureRefiner(nn.Module):
+    """Compact feature-refinement branch used by Decoder 0 Option B."""
+    def __init__(self, in_channels: int, hidden_channels: int = 256):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
 # Original LOG_SUM_EXP and AVG_POOL classes preserved for other decoders
 
 
@@ -266,6 +283,7 @@ class SegRDNet(nn.Module):
         init_checkpoint = False,
         pooling: str = 'avg',  # 'lse' or 'avg'
         use_softcam_decoder0: bool = False,  # Option A: SoftCAM evidence head for Decoder 0
+        softcam_decoder0_mode: str = 'a',  # 'a': head only, 'b': refine features + head
         softcam_lambda_l1: float = 0.0,
         softcam_lambda_l2: float = 0.0,
     ):
@@ -307,13 +325,21 @@ class SegRDNet(nn.Module):
 
         # Option A: SoftCAM evidence head for Decoder 0
         self.use_softcam_decoder0 = use_softcam_decoder0
+        if softcam_decoder0_mode not in {'a', 'b'}:
+            raise ValueError("softcam_decoder0_mode must be 'a' or 'b'")
+        self.softcam_decoder0_mode = softcam_decoder0_mode
         self.softcam_lambda_l1 = softcam_lambda_l1
         self.softcam_lambda_l2 = softcam_lambda_l2
         
         if use_softcam_decoder0:
-            # This replaces fc0 + lse0. The 1,040-channel middle_0 tensor
-            # remains the feature input to up0/Decoder 1.
-            self.softcam_decoder0 = SoftCAMHead(ch_list[0], num_classes)
+            # Both options preserve middle_0 for Decoder 1. Option B refines a
+            # separate copy only for the SoftCAM class-evidence branch.
+            if softcam_decoder0_mode == 'b':
+                self.softcam_refiner0 = SoftCAMFeatureRefiner(ch_list[0])
+                softcam_channels = 256
+            else:
+                softcam_channels = ch_list[0]
+            self.softcam_decoder0 = SoftCAMHead(softcam_channels, num_classes)
 
     def get_softcam_regularization(self):
         """Get SoftCAM regularization loss from Decoder 0 evidence maps."""
@@ -349,7 +375,10 @@ class SegRDNet(nn.Module):
             # Keep decoder features separate from class evidence. Decoder 1
             # consumes middle_0; the SoftCAM map provides decoder-0 logits and
             # its multi-scale class-evidence map.
-            l_out_0, f_out_0 = self.softcam_decoder0(middle_0)
+            softcam_features_0 = middle_0
+            if self.softcam_decoder0_mode == 'b':
+                softcam_features_0 = self.softcam_refiner0(middle_0)
+            l_out_0, f_out_0 = self.softcam_decoder0(softcam_features_0)
         else:
             f_out_0 = self.fc0(middle_0)
             f_out_0 = self.check(f_out_0)
