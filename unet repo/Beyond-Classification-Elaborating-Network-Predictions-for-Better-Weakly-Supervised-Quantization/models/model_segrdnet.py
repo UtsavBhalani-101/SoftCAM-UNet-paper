@@ -219,6 +219,28 @@ class SoftCAMFeatureRefiner(nn.Module):
         return self.layers(x)
 
 
+class SoftCAMDecoderStage(nn.Module):
+    """Full Decoder 0 replacement with evidence and next-stage feature outputs."""
+    def __init__(self, in_channels: int, num_classes: int, feature_channels: int = 256):
+        super().__init__()
+        self.refiner = SoftCAMFeatureRefiner(in_channels, feature_channels)
+        self.softcam_head = SoftCAMHead(feature_channels, num_classes)
+        self.to_next_stage = nn.Sequential(
+            nn.Conv2d(feature_channels, in_channels, kernel_size=1, bias=False),
+            LayerNormChan(in_channels, data_format="channels_first"),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        refined_features = self.refiner(x)
+        logits, evidence_maps = self.softcam_head(refined_features)
+        features_for_next_stage = self.to_next_stage(refined_features)
+        return logits, evidence_maps, features_for_next_stage
+
+    def get_regularization_loss(self, lambda_l1=0.0, lambda_l2=0.0):
+        return self.softcam_head.get_regularization_loss(lambda_l1, lambda_l2)
+
+
 # Original LOG_SUM_EXP and AVG_POOL classes preserved for other decoders
 
 
@@ -283,7 +305,7 @@ class SegRDNet(nn.Module):
         init_checkpoint = False,
         pooling: str = 'avg',  # 'lse' or 'avg'
         use_softcam_decoder0: bool = False,  # Option A: SoftCAM evidence head for Decoder 0
-        softcam_decoder0_mode: str = 'a',  # 'a': head only, 'b': refine features + head
+        softcam_decoder0_mode: str = 'a',  # 'a': head, 'b': side-branch refiner, 'c': replace stage
         softcam_lambda_l1: float = 0.0,
         softcam_lambda_l2: float = 0.0,
     ):
@@ -314,7 +336,7 @@ class SegRDNet(nn.Module):
             self.lse2 = AVG_POOL(num_classes)
             self.lse3 = AVG_POOL(num_classes)
 
-        self.seq0 = nn.Sequential(EffectiveSEModule(ch_list[0])) 
+        self.seq0 = None if (use_softcam_decoder0 and softcam_decoder0_mode == 'c') else nn.Sequential(EffectiveSEModule(ch_list[0]))
         self.up0 = nn.Sequential(nn.Conv2d(ch_list[0], ch_list[1],1,padding=0),DepthToSpace2DWithConv(ch_list[1], 2, 2),LayerNormChan(ch_list[1], data_format="channels_first"))
         self.seq1 = nn.Sequential(nn.Conv2d(2*ch_list[1], ch_list[1],1,padding=0), LayerNormChan(ch_list[1], data_format="channels_first") ,nn.ReLU(),EffectiveSEModule(ch_list[1]))
         self.up1 = nn.Sequential(nn.Conv2d(ch_list[1],ch_list[2],1,padding=0),DepthToSpace2DWithConv(ch_list[2], 2, 2),LayerNormChan(ch_list[2], data_format="channels_first"))               
@@ -325,28 +347,35 @@ class SegRDNet(nn.Module):
 
         # Option A: SoftCAM evidence head for Decoder 0
         self.use_softcam_decoder0 = use_softcam_decoder0
-        if softcam_decoder0_mode not in {'a', 'b'}:
-            raise ValueError("softcam_decoder0_mode must be 'a' or 'b'")
+        if softcam_decoder0_mode not in {'a', 'b', 'c'}:
+            raise ValueError("softcam_decoder0_mode must be 'a', 'b', or 'c'")
         self.softcam_decoder0_mode = softcam_decoder0_mode
         self.softcam_lambda_l1 = softcam_lambda_l1
         self.softcam_lambda_l2 = softcam_lambda_l2
         
         if use_softcam_decoder0:
-            # Both options preserve middle_0 for Decoder 1. Option B refines a
-            # separate copy only for the SoftCAM class-evidence branch.
-            if softcam_decoder0_mode == 'b':
+            if softcam_decoder0_mode == 'c':
+                # Option C replaces seq0 and emits a new compatible feature
+                # tensor for Decoder 1, alongside the class evidence map.
+                self.softcam_decoder0 = SoftCAMDecoderStage(ch_list[0], num_classes)
+            elif softcam_decoder0_mode == 'b':
+                # Option B retains the original feature path and refines only
+                # the separate evidence branch.
                 self.softcam_refiner0 = SoftCAMFeatureRefiner(ch_list[0])
                 softcam_channels = 256
-            else:
+                self.softcam_decoder0 = SoftCAMHead(softcam_channels, num_classes)
+            else:  # Option A
                 softcam_channels = ch_list[0]
-            self.softcam_decoder0 = SoftCAMHead(softcam_channels, num_classes)
+                self.softcam_decoder0 = SoftCAMHead(softcam_channels, num_classes)
 
     def get_softcam_regularization(self):
         """Get SoftCAM regularization loss from Decoder 0 evidence maps."""
         if self.use_softcam_decoder0:
-            return self.softcam_decoder0.get_regularization_loss(
-                self.softcam_lambda_l1, self.softcam_lambda_l2
-            )
+            if self.softcam_decoder0_mode == 'c':
+                return self.softcam_decoder0.get_regularization_loss(
+                    self.softcam_lambda_l1, self.softcam_lambda_l2
+                )
+            return self.softcam_decoder0.get_regularization_loss(self.softcam_lambda_l1, self.softcam_lambda_l2)
         return 0.0
 
 
@@ -370,19 +399,22 @@ class SegRDNet(nn.Module):
 
         outputs = [self.activation[i] for i in range(4)]
         
-        middle_0 = self.seq0(outputs[0])
-        if self.use_softcam_decoder0:
-            # Keep decoder features separate from class evidence. Decoder 1
-            # consumes middle_0; the SoftCAM map provides decoder-0 logits and
-            # its multi-scale class-evidence map.
-            softcam_features_0 = middle_0
-            if self.softcam_decoder0_mode == 'b':
-                softcam_features_0 = self.softcam_refiner0(middle_0)
-            l_out_0, f_out_0 = self.softcam_decoder0(softcam_features_0)
+        if self.use_softcam_decoder0 and self.softcam_decoder0_mode == 'c':
+            # Option C replaces the original seq0 stage. It returns a new
+            # 1,040-channel feature map for up0/Decoder 1 and a class map.
+            l_out_0, f_out_0, middle_0 = self.softcam_decoder0(outputs[0])
         else:
-            f_out_0 = self.fc0(middle_0)
-            f_out_0 = self.check(f_out_0)
-            l_out_0 = self.lse0(f_out_0)
+            middle_0 = self.seq0(outputs[0])
+            if self.use_softcam_decoder0:
+                # Options A/B preserve the original Decoder 0 feature path.
+                softcam_features_0 = middle_0
+                if self.softcam_decoder0_mode == 'b':
+                    softcam_features_0 = self.softcam_refiner0(middle_0)
+                l_out_0, f_out_0 = self.softcam_decoder0(softcam_features_0)
+            else:
+                f_out_0 = self.fc0(middle_0)
+                f_out_0 = self.check(f_out_0)
+                l_out_0 = self.lse0(f_out_0)
         
         middle_1 = self.seq1(torch.cat((outputs[1], self.up0(middle_0)),dim =1 ))
         f_out_1 = self.fc1(middle_1)

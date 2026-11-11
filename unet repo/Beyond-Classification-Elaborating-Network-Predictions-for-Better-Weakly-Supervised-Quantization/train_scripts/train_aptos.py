@@ -411,7 +411,7 @@ def parse_args():
     
     # Option A: SoftCAM Decoder 0
     parser.add_argument('--use-softcam-decoder0', action='store_true', default=False, help='Enable SoftCAM evidence head for Decoder 0')
-    parser.add_argument('--softcam-decoder0-mode', choices=['a', 'b'], default='a', help='A: SoftCAM head only; B: add feature refinement before the SoftCAM head')
+    parser.add_argument('--softcam-decoder0-mode', choices=['a', 'b', 'c'], default='a', help='A: head only; B: preserve features and refine evidence branch; C: replace Decoder 0 and project features to Decoder 1')
     parser.add_argument('--softcam-lambda-l1', default=0.0, type=float, help='L1 regularization weight for SoftCAM evidence maps')
     parser.add_argument('--softcam-lambda-l2', default=0.0, type=float, help='L2 regularization weight for SoftCAM evidence maps')
     parser.add_argument('--softcam-aux-weight', default=0.25, type=float, help='Weight for Decoder 0 SoftCAM classification loss')
