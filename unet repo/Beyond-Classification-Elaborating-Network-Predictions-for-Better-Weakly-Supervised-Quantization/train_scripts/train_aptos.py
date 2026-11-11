@@ -151,14 +151,31 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
     
     grad_accum_steps = getattr(cfg, 'grad_accum_steps', 1)
     
+    # Check if model has SoftCAM regularization
+    has_softcam = hasattr(model, 'get_softcam_regularization')
+    
     for batch_idx, (input, target) in enumerate(loader):
         input = input.to(device)
         target = target.to(device)
         
         # Mixed precision forward
         with amp_autocast():
-            output = model(input)
-            loss = loss_fn(output, target)
+            if cfg.use_softcam_decoder0:
+                output, _, scale_logits = model(input, eval_mode=False)
+                # SegRDNet returns scale logits as (decoder3, decoder2,
+                # decoder1, decoder0). Explicitly supervise the new decoder0
+                # SoftCAM head so it learns class evidence, not just small maps.
+                softcam_aux_loss = loss_fn(scale_logits[-1], target)
+                loss = loss_fn(output, target) + cfg.softcam_aux_weight * softcam_aux_loss
+            else:
+                output = model(input)
+                loss = loss_fn(output, target)
+            
+            # Add SoftCAM regularization loss (L1/L2 on evidence maps)
+            if has_softcam:
+                softcam_reg = model.get_softcam_regularization()
+                if softcam_reg != 0.0:
+                    loss = loss + softcam_reg
         
         # Scale loss for gradient accumulation
         loss = loss / grad_accum_steps
@@ -328,6 +345,12 @@ class Config:
         self.grad_clip = args.grad_clip
         self.log_interval = args.log_interval
         
+        # Option A: SoftCAM Decoder 0
+        self.use_softcam_decoder0 = args.use_softcam_decoder0
+        self.softcam_lambda_l1 = args.softcam_lambda_l1
+        self.softcam_lambda_l2 = args.softcam_lambda_l2
+        self.softcam_aux_weight = args.softcam_aux_weight
+        
         # AMP
         self.amp = args.amp
         self.amp_dtype = args.amp_dtype
@@ -385,6 +408,12 @@ def parse_args():
     # Regularization
     parser.add_argument('--grad-clip', default=1.0, type=float)
     
+    # Option A: SoftCAM Decoder 0
+    parser.add_argument('--use-softcam-decoder0', action='store_true', default=False, help='Enable SoftCAM evidence head for Decoder 0')
+    parser.add_argument('--softcam-lambda-l1', default=0.0, type=float, help='L1 regularization weight for SoftCAM evidence maps')
+    parser.add_argument('--softcam-lambda-l2', default=0.0, type=float, help='L2 regularization weight for SoftCAM evidence maps')
+    parser.add_argument('--softcam-aux-weight', default=0.25, type=float, help='Weight for Decoder 0 SoftCAM classification loss')
+    
     # System
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--output', default='/kaggle/working/segrdnet_aptos', type=str)
@@ -412,6 +441,15 @@ def main():
     print(f"Batch Size: {cfg.batch_size} (effective: {cfg.batch_size * getattr(cfg, 'grad_accum_steps', 1)} with grad_accum={getattr(cfg, 'grad_accum_steps', 1)})")
     print(f"Workers: {cfg.num_workers} (persistent: {cfg.persistent_workers})")
     print(f"Loss: CrossEntropy (label_smoothing={cfg.label_smoothing})")
+    
+    # Option A: SoftCAM Decoder 0
+    if cfg.use_softcam_decoder0:
+        print(f"SoftCAM Decoder 0: ENABLED")
+        print(f"  L1 lambda: {cfg.softcam_lambda_l1}")
+        print(f"  L2 lambda: {cfg.softcam_lambda_l2}")
+    else:
+        print(f"SoftCAM Decoder 0: DISABLED (baseline)")
+    
     print(f"Output: {cfg.save_path}")
     print("="*60)
     
@@ -465,7 +503,13 @@ def main():
     )
     
     # Model - use Average pooling instead of LSE
-    model = SegRDNet(num_classes=cfg.num_classes, pooling='avg')
+    model = SegRDNet(
+        num_classes=cfg.num_classes, 
+        pooling='avg',
+        use_softcam_decoder0=cfg.use_softcam_decoder0,
+        softcam_lambda_l1=cfg.softcam_lambda_l1,
+        softcam_lambda_l2=cfg.softcam_lambda_l2
+    )
     
     model.to(cfg.device)
     

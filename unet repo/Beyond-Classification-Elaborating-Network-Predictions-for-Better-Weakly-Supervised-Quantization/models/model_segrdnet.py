@@ -1,18 +1,14 @@
 import torch
-import torch.nn as nn 
+import torch.nn as nn
 from functools import partial
 from typing import List
 from torchvision import models
 from models.rdnet import *
-import torch
-import torch.nn as nn
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers.squeeze_excite import EffectiveSEModule
-from timm.models import create_model,register_model, build_model_with_cfg, named_apply, generate_default_cfgs
+from timm.models import create_model, register_model, build_model_with_cfg, named_apply, generate_default_cfgs
 from timm.models.layers import DropPath
 from timm.models.layers import LayerNorm2d
-
-from timm.layers.squeeze_excite import EffectiveSEModule
 import torch.nn.functional as F
 
 
@@ -154,6 +150,61 @@ class AVG_POOL(nn.Module):
         return F.adaptive_avg_pool2d(x, (1, 1)).flatten(1)
 
 
+class SoftCAMHead(nn.Module):
+    """
+    SoftCAM-style evidence head for a decoder stage.
+    Produces per-class evidence maps and global predictions.
+    Includes L1/L2 regularization on evidence maps (SoftCAM training objective).
+    """
+    def __init__(self, in_channels: int, num_classes: int):
+        super().__init__()
+        self.num_classes = num_classes
+        self.in_channels = in_channels
+        
+        # SoftCAM-style classifier: 1x1 conv producing per-class evidence maps
+        self.classifier = nn.Conv2d(in_channels, num_classes, kernel_size=1, stride=1, padding=0)
+        
+        # Global average pooling for classification logits
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Store evidence maps for regularization
+        self.evidence_maps = None
+        
+    def forward(self, x):
+        """
+        Args:
+            x: (B, C, H, W) feature maps from decoder
+        Returns:
+            logits: (B, num_classes) - global predictions
+            evidence_maps: (B, num_classes, H, W) - per-class evidence maps
+        """
+        # Produce per-class evidence maps
+        evidence_maps = self.classifier(x)  # (B, num_classes, H, W)
+        
+        # Store for regularization loss
+        self.evidence_maps = evidence_maps
+        
+        # Global average pooling for classification
+        logits = self.avgpool(evidence_maps).flatten(1)  # (B, num_classes)
+        
+        return logits, evidence_maps
+    
+    def get_regularization_loss(self, lambda_l1=0.0, lambda_l2=0.0):
+        """
+        Compute L1/L2 regularization on evidence maps (SoftCAM training objective).
+        """
+        if self.evidence_maps is None:
+            return 0.0
+        
+        l1_loss = torch.norm(self.evidence_maps, p=1) if lambda_l1 > 0 else 0.0
+        l2_loss = torch.norm(self.evidence_maps, p=2) if lambda_l2 > 0 else 0.0
+        
+        return lambda_l1 * l1_loss + lambda_l2 * l2_loss
+
+
+# Original LOG_SUM_EXP and AVG_POOL classes preserved for other decoders
+
+
 
 
 
@@ -214,6 +265,9 @@ class SegRDNet(nn.Module):
         num_classes = 6,
         init_checkpoint = False,
         pooling: str = 'avg',  # 'lse' or 'avg'
+        use_softcam_decoder0: bool = False,  # Option A: SoftCAM evidence head for Decoder 0
+        softcam_lambda_l1: float = 0.0,
+        softcam_lambda_l2: float = 0.0,
     ):
         super().__init__()
 
@@ -251,6 +305,24 @@ class SegRDNet(nn.Module):
         self.seq3 = nn.Sequential(nn.Conv2d(2*ch_list[3], ch_list[3],1,padding=0),LayerNormChan(ch_list[3], data_format="channels_first") ,nn.ReLU(),EffectiveSEModule(ch_list[3]))
         self.check = nn.Identity()
 
+        # Option A: SoftCAM evidence head for Decoder 0
+        self.use_softcam_decoder0 = use_softcam_decoder0
+        self.softcam_lambda_l1 = softcam_lambda_l1
+        self.softcam_lambda_l2 = softcam_lambda_l2
+        
+        if use_softcam_decoder0:
+            # This replaces fc0 + lse0. The 1,040-channel middle_0 tensor
+            # remains the feature input to up0/Decoder 1.
+            self.softcam_decoder0 = SoftCAMHead(ch_list[0], num_classes)
+
+    def get_softcam_regularization(self):
+        """Get SoftCAM regularization loss from Decoder 0 evidence maps."""
+        if self.use_softcam_decoder0:
+            return self.softcam_decoder0.get_regularization_loss(
+                self.softcam_lambda_l1, self.softcam_lambda_l2
+            )
+        return 0.0
+
 
     def init_forward_hook(self):
         for (name, module) in self.model.named_modules():
@@ -271,10 +343,18 @@ class SegRDNet(nn.Module):
         x = self.model(x)
 
         outputs = [self.activation[i] for i in range(4)]
+        
         middle_0 = self.seq0(outputs[0])
-        f_out_0 = self.fc0(middle_0)
-        f_out_0 = self.check(f_out_0)
-        l_out_0 = self.lse0(f_out_0)
+        if self.use_softcam_decoder0:
+            # Keep decoder features separate from class evidence. Decoder 1
+            # consumes middle_0; the SoftCAM map provides decoder-0 logits and
+            # its multi-scale class-evidence map.
+            l_out_0, f_out_0 = self.softcam_decoder0(middle_0)
+        else:
+            f_out_0 = self.fc0(middle_0)
+            f_out_0 = self.check(f_out_0)
+            l_out_0 = self.lse0(f_out_0)
+        
         middle_1 = self.seq1(torch.cat((outputs[1], self.up0(middle_0)),dim =1 ))
         f_out_1 = self.fc1(middle_1)
         l_out_1 = self.lse1(f_out_1)
@@ -284,7 +364,15 @@ class SegRDNet(nn.Module):
         middle_3 = self.seq3(torch.cat((outputs[3], self.up2(middle_2)),dim =1 ))
         f_out_3 = self.fc3(middle_3)
         l_out_3 = self.lse3(f_out_3)
-        mse_loss = [ F.mse_loss(F.adaptive_avg_pool2d(f_out_1, (16,16)) , f_out_0 ), F.mse_loss(F.adaptive_avg_pool2d(f_out_2, (32,32)) , f_out_1 ), F.mse_loss(F.adaptive_avg_pool2d(f_out_3, (64,64)) , f_out_2 )][::-1]
+        
+        # For Option A, f_out_0 is the SoftCAM evidence map; otherwise it is
+        # the original fc0 map. Both remain class-channel tensors for MSE.
+        mse_loss = [ 
+            F.mse_loss(F.adaptive_avg_pool2d(f_out_1, (16,16)), f_out_0),
+            F.mse_loss(F.adaptive_avg_pool2d(f_out_2, (32,32)), f_out_1),
+            F.mse_loss(F.adaptive_avg_pool2d(f_out_3, (64,64)), f_out_2)
+        ][::-1]
+        
         if not eval_mode:
             return l_out_3  , mse_loss , (l_out_3, l_out_2, l_out_1, l_out_0)
         else:
