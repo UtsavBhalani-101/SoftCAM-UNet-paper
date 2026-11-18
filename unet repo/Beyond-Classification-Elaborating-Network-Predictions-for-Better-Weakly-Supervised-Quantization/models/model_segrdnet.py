@@ -311,7 +311,9 @@ class SegRDNet(nn.Module):
     ):
         super().__init__()
 
-        self.model = create_model( 'rdnet_tiny', pretrained= False, in_chans=3, num_classes=num_classes, drop_rate=0.0, drop_path_rate= 0, drop_block_rate=0, global_pool=None,)
+        # Backbone must stay ImageNet-pretrained; the Nov 10 "85 QWK by epoch 5"
+        # runs used the old hardcoded pretrained=True path.
+        self.model = create_model( 'rdnet_tiny', pretrained= True, in_chans=3, num_classes=num_classes, drop_rate=0.0, drop_path_rate= 0, drop_block_rate=0, global_pool=None,)
         self.activation = {}
         self.name_dict = {'dense_stages.0':3, 'dense_stages.1':2, 'dense_stages.5':1, 'dense_stages.6':0}
         self.init_forward_hook()
