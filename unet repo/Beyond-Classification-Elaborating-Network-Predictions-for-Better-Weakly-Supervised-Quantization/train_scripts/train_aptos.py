@@ -334,6 +334,7 @@ class Config:
         self.num_workers = args.workers
         self.persistent_workers = True if args.workers > 0 else False
         self.num_classes = args.num_classes
+        self.pooling = getattr(args, 'pooling', 'avg')
         
         # Model (fixed: SegRDNet with RDNet Tiny backbone)
         self.epochs = args.epochs
