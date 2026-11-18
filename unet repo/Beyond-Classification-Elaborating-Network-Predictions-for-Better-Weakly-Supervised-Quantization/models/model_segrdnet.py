@@ -326,10 +326,10 @@ class SegRDNet(nn.Module):
         
         # Pooling selection for multi-scale outputs
         if pooling == 'lse':
-            self.lse0 = LOG_SUM_EXP(num_classes)
-            self.lse1 = LOG_SUM_EXP(num_classes)
-            self.lse2 = LOG_SUM_EXP(num_classes)
-            self.lse3 = LOG_SUM_EXP(num_classes)
+            self.lse0 = LOG_SUM_EXP(num_classes=num_classes)
+            self.lse1 = LOG_SUM_EXP(num_classes=num_classes)
+            self.lse2 = LOG_SUM_EXP(num_classes=num_classes)
+            self.lse3 = LOG_SUM_EXP(num_classes=num_classes)
         else:  # 'avg'
             self.lse0 = AVG_POOL(num_classes)
             self.lse1 = AVG_POOL(num_classes)
