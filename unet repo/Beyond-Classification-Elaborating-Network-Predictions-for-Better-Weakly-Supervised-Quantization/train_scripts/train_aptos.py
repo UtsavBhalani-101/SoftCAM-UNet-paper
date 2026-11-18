@@ -389,6 +389,8 @@ def parse_args():
     
     # Model
     parser.add_argument('--num-classes', default=5, type=int)
+    parser.add_argument('--pooling', default='avg', choices=['lse', 'avg'], type=str,
+                        help='Spatial pooling of the evidence maps: lse (original) or avg')
     
     # Training - USER SPECIFIED
     parser.add_argument('--epochs', default=20, type=int, help='20 epochs')
@@ -504,10 +506,10 @@ def main():
         persistent_workers=cfg.persistent_workers
     )
     
-    # Model - use Average pooling instead of LSE
+    # Model - evidence-map pooling selectable via --pooling
     model = SegRDNet(
-        num_classes=cfg.num_classes, 
-        pooling='avg',
+        num_classes=cfg.num_classes,
+        pooling=cfg.pooling,
         use_softcam_decoder0=cfg.use_softcam_decoder0,
         softcam_decoder0_mode=cfg.softcam_decoder0_mode,
         softcam_lambda_l1=cfg.softcam_lambda_l1,
