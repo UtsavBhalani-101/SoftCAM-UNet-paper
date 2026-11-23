@@ -12,6 +12,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow/absl logs
 
 import sys
 import time
+import re
 import random
 import argparse
 import logging
@@ -24,7 +25,7 @@ from sklearn.metrics import cohen_kappa_score, confusion_matrix, classification_
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
 import torchvision.transforms as T
@@ -243,6 +244,74 @@ def compute_all_metrics(preds, targets, num_classes=5):
     }
 
 
+def _fmt_list(values, precision):
+    fmt = '{:.' + str(precision) + 'f}'
+    return '[' + ' '.join(fmt.format(v) for v in values) + ']'
+
+
+def fmt_lr(lr):
+    text = f'{lr:.1e}'
+    return text.replace('e-0', 'e-').replace('e+0', 'e+')
+
+
+def fmt_score(value, precision):
+    return re.sub(r'^(-?)0\.', r'\1.', f'{value:.{precision}f}')
+
+
+def activation_map_stats(activations, batch_size, acc=None):
+    """Running stats over activation maps [B, num_classes, h, w].
+
+    SoftCAM produces a single map scale, so this is reported as one stage.
+    Returns None when acc is None; callers accumulate per batch.
+    """
+    if acc is None:
+        acc = {'mean_abs': 0.0, 'frac_pos': 0.0, 'n': 0}
+    acc['mean_abs'] += activations.detach().float().abs().mean().item() * batch_size
+    acc['frac_pos'] += (activations.detach() > 0).float().mean().item() * batch_size
+    acc['n'] += batch_size
+    return acc
+
+
+def per_class_recall(conf_mat):
+    """Recall per class from a confusion matrix (0 when a class has no GT samples)."""
+    support = conf_mat.sum(axis=1)
+    return np.divide(np.diag(conf_mat), support, out=np.zeros_like(np.diag(conf_mat), dtype=float), where=support > 0)
+
+
+def print_epoch_summary(epoch, secs, lr, train_loss, val_loss, train_eval_metrics,
+                        val_metrics, num_classes, train_eval_n=None):
+    # Header
+    print(f'ep {epoch:02d} | lr {fmt_lr(lr)} | {secs:.0f}s')
+    # Loss breakdown (vanilla SoftCAM optimizes a single CE term; mixup folds into it)
+    print(f'loss  train: {train_loss:.2f} = ce {train_loss:.2f} | val ce {val_loss:.2f}')
+    # Metric line
+    train_n = f'train(eval, {train_eval_n} imgs): ' if train_eval_n else 'train(eval): '
+    print(
+        f'{train_n}qwk {fmt_score(train_eval_metrics["qwk"], 2)} acc {fmt_score(train_eval_metrics["accuracy"], 2)}'
+        f' | val: qwk {fmt_score(val_metrics["qwk"], 4)} acc {fmt_score(val_metrics["accuracy"], 4)} auc {fmt_score(val_metrics["auc_macro"], 4)}'
+    )
+    # Recall by grade and predicted counts
+    cm = val_metrics['confusion_matrix']
+    recall = per_class_recall(cm)
+    pred_counts = np.bincount(val_metrics['pred_labels'], minlength=num_classes)
+    print(f'val recall by grade: {_fmt_list(recall, 2)} | pred counts: {_fmt_list(pred_counts, 0)}')
+    for grade in range(num_classes):
+        if pred_counts[grade] == 0:
+            print(f'WARNING: grade {grade} never predicted')
+    # Confusion matrix
+    print('val confusion matrix (rows = GT grade, cols = predicted grade):')
+    for row in cm:
+        print('  ' + ' '.join(f'{int(v):5d}' for v in row))
+    # Activation-map stats
+    map_stats = val_metrics.get('map_stats')
+    if map_stats is not None:
+        n = max(1, map_stats['n'])
+        print(
+            f'maps (val): mean|A| per stage {_fmt_list([map_stats["mean_abs"] / n], 3)}'
+            f' | frac>0 per stage {_fmt_list([map_stats["frac_pos"] / n], 3)}'
+        )
+
+
 # =============================================================================
 # TRAINING & VALIDATION
 # =============================================================================
@@ -281,7 +350,7 @@ def train_epoch(cfg, model, train_loader, optimizer, criterion, epoch):
         all_targets.append(targets.detach())
         
         if batch_idx % cfg.log_interval == 0:
-            print(f'Epoch {epoch} [{batch_idx}/{len(train_loader)}] Loss: {loss.item():.4f}')
+            print(f'ep {epoch:02d} [{batch_idx}/{len(train_loader)}] ce {loss.item():.3f}')
     
     train_metrics = compute_all_metrics(torch.cat(all_preds), torch.cat(all_targets), cfg.num_classes)
     train_metrics['loss'] = epoch_loss / len(train_loader)
@@ -293,6 +362,7 @@ def evaluate(cfg, model, loader, criterion):
     all_preds = []
     all_targets = []
     total_loss = 0.0
+    map_acc = None
     
     with torch.no_grad():
         for batch in loader:
@@ -301,7 +371,9 @@ def evaluate(cfg, model, loader, criterion):
             
             outputs = model(images)
             if isinstance(outputs, tuple):
-                outputs = outputs[0]
+                logits, activations = outputs
+                map_acc = activation_map_stats(activations, images.size(0), map_acc)
+                outputs = logits
             
             loss = criterion(outputs, targets)
             total_loss += loss.item()
@@ -310,6 +382,8 @@ def evaluate(cfg, model, loader, criterion):
     
     metrics = compute_all_metrics(torch.cat(all_preds), torch.cat(all_targets), cfg.num_classes)
     metrics['loss'] = total_loss / len(loader)
+    if map_acc is not None:
+        metrics['map_stats'] = map_acc
     return metrics
 
 
@@ -527,6 +601,8 @@ def parse_args():
     
     # System
     parser.add_argument('--seed', default=42, type=int)
+    parser.add_argument('--train-eval-n', default=500, type=int,
+                        help='Number of training images re-evaluated with val transforms each epoch')
     parser.add_argument('--output', default='/kaggle/working/softcam_aptos', type=str)
     parser.add_argument('--log-interval', default=20, type=int)
     parser.add_argument('--generate-heatmaps', action='store_true', default=True)
@@ -546,14 +622,29 @@ def main():
     print(f"GPUs available: {cfg.num_gpus}")
     if cfg.num_gpus > 0:
         print(f"  Using {cfg.num_gpus} GPU(s)")
+    print(f"Seed: {args.seed}")
     print(f"Network: {cfg.network}")
+    print(f"Pretrained: {cfg.pretrained}")
     print(f"Conv Classifier (heatmaps): {cfg.conv_cls}")
     print(f"Epochs: {cfg.epochs}")
     print(f"Batch Size: {cfg.batch_size} (per GPU: {args.batch_size})")
+    print(f"Val Batch Size: {cfg.val_batch_size} (per GPU: {args.val_batch_size})")
     print(f"Workers: {cfg.num_workers} (persistent: {cfg.persistent_workers})")
-    print(f"Loss: {cfg.loss}")
+    print(f"Image Size: {cfg.img_size}")
+    print(f"Optimizer: {cfg.optimizer}, LR: {cfg.lr}, Weight Decay: {cfg.weight_decay}")
+    print(f"Scheduler: {cfg.scheduler}")
+    print(f"Loss: {cfg.loss}, Label Smoothing: {cfg.label_smoothing}")
     print(f"MixUp: {cfg.mixup}, CutMix: {cfg.cutmix}")
+    print(f"Grad Clip: {cfg.grad_clip}")
+    print(f"Num Classes: {cfg.num_classes}")
+    print(f"Train/Val Split: 80/20 seeded index split")
+    print(f"Train-eval subset: {args.train_eval_n} imgs (val transforms)")
+    print(f"Data Dir: {cfg.data_dir}")
+    print(f"Train CSV: {cfg.train_csv}, Train Img Dir: {cfg.train_img_dir}")
     print(f"Output: {cfg.save_path}")
+    import platform
+    import torch as _torch
+    print(f"Python: {platform.python_version()}, PyTorch: {_torch.__version__}, CUDA: {_torch.version.cuda}")
     print("="*60)
     
     # Set seed
@@ -574,14 +665,22 @@ def main():
     train_csv_path = os.path.join(cfg.data_dir, cfg.train_csv)
     train_img_dir = os.path.join(cfg.data_dir, cfg.train_img_dir)
     
-    full_dataset = APTOSDataset(train_csv_path, train_img_dir, transform=train_transform, mode='train')
+    full_dataset = APTOSDataset(train_csv_path, train_img_dir, transform=None, mode='train')
+    split_rng = torch.Generator().manual_seed(args.seed)
+    indices = torch.randperm(len(full_dataset), generator=split_rng).tolist()
     train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
-    val_dataset.dataset.transform = val_transform
-    val_dataset.dataset.mode = 'val'
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:]
     
-    print(f'Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}')
+    # Separate dataset instances so val transforms never leak into training images
+    train_source = APTOSDataset(train_csv_path, train_img_dir, transform=train_transform, mode='train')
+    val_source = APTOSDataset(train_csv_path, train_img_dir, transform=val_transform, mode='val')
+    train_dataset = Subset(train_source, train_indices)
+    val_dataset = Subset(val_source, val_indices)
+    train_eval_n = min(args.train_eval_n, len(train_indices))
+    train_eval_dataset = Subset(val_source, train_indices[:train_eval_n])
+    
+    print(f'Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Train-eval subset: {len(train_eval_dataset)}')
     
     train_loader = DataLoader(
         train_dataset, 
@@ -597,6 +696,14 @@ def main():
         batch_size=cfg.val_batch_size, 
         shuffle=False,
         num_workers=cfg.num_workers, 
+        pin_memory=True,
+        persistent_workers=cfg.persistent_workers
+    )
+    train_eval_loader = DataLoader(
+        train_eval_dataset,
+        batch_size=cfg.val_batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
         pin_memory=True,
         persistent_workers=cfg.persistent_workers
     )
@@ -626,26 +733,28 @@ def main():
         epoch_start = time.time()
         
         train_metrics = train_epoch(cfg, model, train_loader, optimizer, criterion, epoch)
+        # Re-evaluate a fixed train subset with val transforms for honest train metrics
+        train_eval_metrics = evaluate(cfg, model, train_eval_loader, criterion)
         val_metrics = evaluate(cfg, model, val_loader, criterion)
+        secs = time.time() - epoch_start
+        lr_now = optimizer.param_groups[0]['lr']
         
         # Logging
         logger.add_scalar('Loss/train', train_metrics['loss'], epoch)
         logger.add_scalar('Loss/val', val_metrics['loss'], epoch)
-        logger.add_scalar('AUC/train', train_metrics['auc_macro'], epoch)
+        logger.add_scalar('AUC/train', train_eval_metrics['auc_macro'], epoch)
         logger.add_scalar('AUC/val', val_metrics['auc_macro'], epoch)
-        logger.add_scalar('Acc/train', train_metrics['accuracy'], epoch)
+        logger.add_scalar('Acc/train', train_eval_metrics['accuracy'], epoch)
         logger.add_scalar('Acc/val', val_metrics['accuracy'], epoch)
+        logger.add_scalar('QWK/train', train_eval_metrics['qwk'], epoch)
         logger.add_scalar('QWK/val', val_metrics['qwk'], epoch)
         logger.add_scalar('Kappa/val', val_metrics['kappa'], epoch)
         
-        # Print metrics
-        print(f'\nEpoch {epoch} ({time.time() - epoch_start:.1f}s):')
-        print(f'  Train: Loss={train_metrics["loss"]:.4f}, QWK={train_metrics["qwk"]:.4f}, Acc={train_metrics["accuracy"]:.4f}, AUC={train_metrics["auc_macro"]:.4f}')
-        print(f'  Valid: Loss={val_metrics["loss"]:.4f}, QWK={val_metrics["qwk"]:.4f}, Acc={val_metrics["accuracy"]:.4f}, AUC={val_metrics["auc_macro"]:.4f}, Kappa={val_metrics["kappa"]:.4f}')
-        print(f'  AUC per class: {val_metrics["auc_per_class"]}')
-        print(f'  Acc per class: {val_metrics["accuracy_per_class"]}')
-        print(f'  Confusion Matrix:')
-        print(val_metrics['confusion_matrix'])
+        print()
+        print_epoch_summary(
+            epoch, secs, lr_now, train_metrics['loss'], val_metrics['loss'],
+            train_eval_metrics, val_metrics, cfg.num_classes, train_eval_n=len(train_eval_dataset),
+        )
         
         # Save best model (by QWK - official APTOS metric)
         metric = val_metrics['qwk']
