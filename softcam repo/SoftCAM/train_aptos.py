@@ -21,12 +21,14 @@ import pandas as pd
 from datetime import datetime
 from collections import OrderedDict
 from sklearn.metrics import cohen_kappa_score, confusion_matrix, classification_report
+from sklearn.exceptions import UndefinedMetricWarning
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
+import warnings
 
 import torchvision.transforms as T
 from torchvision import models
@@ -42,6 +44,10 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from modules.models import FullyConvModel, ConvClassifier
 from modules.loss import FocalLoss, KappaLoss
 from utils.func import one_hot
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 
 # =============================================================================
@@ -267,7 +273,7 @@ def compute_all_metrics(preds, targets, num_classes=5):
     kappa = multiclass_cohen_kappa(preds, targets, num_classes=num_classes).item()
     
     # Classification Report
-    report = classification_report(targets_np, pred_labels, target_names=[f'Class {i}' for i in range(num_classes)], output_dict=True)
+    report = classification_report(targets_np, pred_labels, target_names=[f'Class {i}' for i in range(num_classes)], output_dict=True, zero_division=0)
     
     return {
         'qwk': qwk,
