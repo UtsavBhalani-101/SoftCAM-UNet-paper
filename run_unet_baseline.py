@@ -49,7 +49,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smoke", action="store_true",
                         help="Smoke test: train on 200 images, 2 epochs")
     parser.add_argument("--tiny-overfit", action="store_true",
-                        help="Overfit 64 images for 50 steps and print training accuracy, then exit")
+                        help="Overfit 64 images for N steps and print training accuracy, then exit")
+    parser.add_argument("--tiny-overfit-steps", type=int, default=50,
+                        help="Optimizer steps for --tiny-overfit (use 200+ for this 58M-param model)")
     # wandb / resume pass-through
     parser.add_argument("--wandb", action="store_true", help="Forward wandb logging to the trainer")
     parser.add_argument("--wandb-project", default="MICCAI", type=str)
@@ -75,6 +77,7 @@ def run_and_archive(label: str, command: list[str], cwd: Path, log_path: Path) -
     captured: list[str] = []
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("HF_HUB_VERBOSITY", "error")
 
     with log_path.open("w", encoding="utf-8", newline="") as log_file:
         log_file.write("\n".join(header) + "\n")
@@ -152,7 +155,7 @@ def main() -> int:
     if args.smoke:
         command.append("--smoke")
     if args.tiny_overfit:
-        command.append("--tiny-overfit")
+        command.extend(["--tiny-overfit", "--tiny-overfit-steps", str(args.tiny_overfit_steps)])
     if args.wandb:
         command.append("--wandb")
         if args.wandb_project:

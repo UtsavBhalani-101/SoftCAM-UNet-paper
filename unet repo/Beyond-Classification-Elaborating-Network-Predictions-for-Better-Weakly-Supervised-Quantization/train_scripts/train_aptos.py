@@ -5,10 +5,21 @@ Single-file entry point for 5-class DR classification on APTOS dataset.
 Uses existing SegRDNet model code from models/model_segrdnet.py
 """
 import os
+import warnings
 
 # Suppress CUDA driver warnings BEFORE importing torch
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+# Quiet the huggingface_hub "unauthenticated requests" notice (logger-based, read at import)
+os.environ['HF_HUB_VERBOSITY'] = 'error'
+
+# Silence known import-time noise before models/timm load:
+# - timm.models.layers deprecation FutureWarning
+# - rdnet.py re-registering rdnet_* models that timm already ships
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore', category=UserWarning, message=r'.*Overwriting rdnet_.*')
+warnings.filterwarnings('ignore', category=UserWarning, message=r'.*torch.utils.tensorboard.*')
 
 import sys
 import time
@@ -32,7 +43,6 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 from torch.utils.data import Dataset, DataLoader, random_split, Subset, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
-import warnings
 
 import torchvision.transforms as T
 from PIL import Image
@@ -347,11 +357,13 @@ def pretrained_weights_status(base_model, num_classes):
 
 
 def tiny_overfit(cfg, model, optimizer, loss_fn, amp_autocast=suppress, loss_scaler=None):
-    """Overfit 64 val-transform images for 50 optimizer steps; report train accuracy.
+    """Overfit 64 val-transform images for cfg.tiny_overfit_steps; report train accuracy.
 
     Deliberately uses val transforms so accuracy is meaningful and overfitting
-    is achievable; if the loss does not collapse, something is broken.
+    is achievable; if the loss does not collapse with enough steps, something
+    is broken.
     """
+    total_steps = max(1, int(getattr(cfg, 'tiny_overfit_steps', 50)))
     csv_path = os.path.join(cfg.data_dir, cfg.train_csv)
     img_dir = os.path.join(cfg.data_dir, cfg.train_img_dir)
     dataset = APTOSDataset(csv_path, img_dir, transform=get_transforms(cfg.img_size, 'val'), mode='val')
@@ -368,7 +380,7 @@ def tiny_overfit(cfg, model, optimizer, loss_fn, amp_autocast=suppress, loss_sca
     # if these are mostly grade 0, a collapsed (majority-class) model already
     # scores that share as accuracy. Print the composition to interpret the cap.
     subset_labels = np.bincount([int(dataset[i][1]) for i in range(n)], minlength=cfg.num_classes)
-    print(f'Tiny-overfit: {n} images (val transforms), 50 optimizer steps')
+    print(f'Tiny-overfit: {n} images (val transforms), {total_steps} optimizer steps')
     print(f'  class distribution of those {n} images: {subset_labels.tolist()}')
 
     # Diagnostic plumbing test: the training lr (1e-4) is far too small to
@@ -381,9 +393,9 @@ def tiny_overfit(cfg, model, optimizer, loss_fn, amp_autocast=suppress, loss_sca
     print(f'  tiny-overfit LR override: {cfg.lr} -> {overfit_lr}')
     model.train()
     steps, correct, seen, running_loss = 0, 0, 0, 0.0
-    while steps < 50:
+    while steps < total_steps:
         for input, target in loader:
-            if steps >= 50:
+            if steps >= total_steps:
                 break
             input = input.to(cfg.device)
             target = target.to(cfg.device)
@@ -413,10 +425,10 @@ def tiny_overfit(cfg, model, optimizer, loss_fn, amp_autocast=suppress, loss_sca
             running_loss += loss.item()
             steps += 1
             if steps % 10 == 0:
-                print(f'  step {steps:02d}/50 | running loss {running_loss / steps:.3f} '
+                print(f'  step {steps:02d}/{total_steps} | running loss {running_loss / steps:.3f} '
                       f'| running train acc {correct / max(1, seen):.3f}')
 
-    print(f'tiny-overfit training accuracy over all 50 steps: '
+    print(f'tiny-overfit training accuracy over all {total_steps} steps: '
           f'{correct / max(1, seen):.4f} (mean loss {running_loss / steps:.4f})')
 
 
@@ -507,6 +519,7 @@ class Config:
         # Debug / sanity modes
         self.smoke = getattr(args, 'smoke', False)
         self.tiny_overfit = getattr(args, 'tiny_overfit', False)
+        self.tiny_overfit_steps = getattr(args, 'tiny_overfit_steps', 50)
         
         # Output
         self.save_path = args.output
@@ -772,7 +785,9 @@ def parse_args():
     # Debug / sanity modes
     parser.add_argument('--smoke', action='store_true', help='Train on 200 images, cap epochs at 2')
     parser.add_argument('--tiny-overfit', action='store_true',
-                        help='Overfit 64 val-transform images for 50 optimizer steps; prints training accuracy')
+                        help='Overfit 64 val-transform images for N optimizer steps; prints training accuracy')
+    parser.add_argument('--tiny-overfit-steps', default=50, type=int,
+                        help='Optimizer steps for --tiny-overfit (50 default; use 200+ for this 58M-param model)')
     
     args = parser.parse_args()
     if args.smoke:
@@ -800,7 +815,7 @@ def main():
         if cfg.smoke:
             modes.append('smoke (train capped at 200 imgs, epochs capped at 2)')
         if cfg.tiny_overfit:
-            modes.append('tiny-overfit (64 imgs, 50 steps)')
+            modes.append(f'tiny-overfit (64 imgs, {cfg.tiny_overfit_steps} steps)')
         print(f"Mode: {', '.join(modes)}")
     print(f"Seed: {args.seed}")
     print(f"Batch Size: {cfg.batch_size}/GPU (effective: {cfg.batch_size * cfg.grad_accum_steps * cfg.world_size} with grad_accum={cfg.grad_accum_steps}, world={cfg.world_size})")
