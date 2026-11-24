@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="/kaggle/working/softcam_vanilla_baseline")
     # wandb / resume pass-through
     parser.add_argument("--wandb", action="store_true", help="Forward wandb logging to the trainer")
-    parser.add_argument("--wandb-project", default=None, type=str)
+    parser.add_argument("--wandb-project", default="MICCAI", type=str)
     parser.add_argument("--wandb-entity", default=None, type=str)
     parser.add_argument("--wandb-run-name", default=None, type=str)
     parser.add_argument("--resume", default=None, type=str,
@@ -125,7 +125,7 @@ def main() -> int:
     archive_dir = Path(args.output) / "baseline_raw_logs" / run_id
 
     command = [
-        sys.executable, str(softcam_script),
+        sys.executable or "python", str(softcam_script),
         "--data-dir", args.data_dir,
         "--epochs", str(args.epochs),
         "--workers", str(args.workers),
@@ -138,7 +138,9 @@ def main() -> int:
     if args.resume:
         command.extend(["--resume", args.resume])
     if args.wandb:
-        command.extend(["--wandb", "--wandb-project", args.wandb_project])
+        command.append("--wandb")
+        if args.wandb_project:
+            command.extend(["--wandb-project", args.wandb_project])
         if args.wandb_entity:
             command.extend(["--wandb-entity", args.wandb_entity])
         if args.wandb_run_name:
