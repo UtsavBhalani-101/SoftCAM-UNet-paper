@@ -46,6 +46,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="/kaggle/working/segrdnet_baseline")
     parser.add_argument("--no-multi-gpu", action="store_true",
                         help="Force single-GPU training even when multiple GPUs are visible")
+    parser.add_argument("--smoke", action="store_true",
+                        help="Smoke test: train on 200 images, 2 epochs")
+    parser.add_argument("--tiny-overfit", action="store_true",
+                        help="Overfit 64 images for 50 steps and print training accuracy, then exit")
     # wandb / resume pass-through
     parser.add_argument("--wandb", action="store_true", help="Forward wandb logging to the trainer")
     parser.add_argument("--wandb-project", default="MICCAI", type=str)
@@ -145,6 +149,10 @@ def main() -> int:
     ])
     if args.resume:
         command.extend(["--resume", args.resume])
+    if args.smoke:
+        command.append("--smoke")
+    if args.tiny_overfit:
+        command.append("--tiny-overfit")
     if args.wandb:
         command.append("--wandb")
         if args.wandb_project:

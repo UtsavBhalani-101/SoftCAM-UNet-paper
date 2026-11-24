@@ -146,6 +146,9 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
     all_predictions = []
     all_targets = []
     losses_m = 0.0
+    ce_losses_m = 0.0
+    aux_losses_m = 0.0
+    reg_losses_m = 0.0
     num_batches = 0
 
     model.train()
@@ -153,31 +156,44 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
     
     grad_accum_steps = getattr(cfg, 'grad_accum_steps', 1)
     
-    # Check if model has SoftCAM regularization
-    has_softcam = hasattr(model, 'get_softcam_regularization')
+    # Check if the underlying model (DDP/DataParallel-unwrapped) has SoftCAM
+    # regularization; nn.Module attribute lookups do not forward methods through
+    # the DDP wrapper, so hasattr on the wrapper would silently return False
+    base_model = _unwrap_model(model)
+    has_softcam = hasattr(base_model, 'get_softcam_regularization')
     
     for batch_idx, (input, target) in enumerate(loader):
         input = input.to(device)
         target = target.to(device)
         
-        # Mixed precision forward
+        # Mixed precision forward with separately tracked loss terms
         with amp_autocast():
             if cfg.use_softcam_decoder0:
                 output, _, scale_logits = model(input, eval_mode=False)
                 # SegRDNet returns scale logits as (decoder3, decoder2,
-                # decoder1, decoder0). Explicitly supervise the new decoder0
-                # SoftCAM head so it learns class evidence, not just small maps.
+                # decoder1, decoder0). Supervise the new decoder0 SoftCAM head
+                # so it learns class evidence, not just small maps.
+                ce_loss = loss_fn(output, target)
                 softcam_aux_loss = loss_fn(scale_logits[-1], target)
-                loss = loss_fn(output, target) + cfg.softcam_aux_weight * softcam_aux_loss
+                loss = ce_loss + cfg.softcam_aux_weight * softcam_aux_loss
             else:
                 output = model(input)
-                loss = loss_fn(output, target)
+                ce_loss = loss_fn(output, target)
+                softcam_aux_loss = None
+                loss = ce_loss
             
             # Add SoftCAM regularization loss (L1/L2 on evidence maps)
+            softcam_reg = None
             if has_softcam:
-                softcam_reg = model.get_softcam_regularization()
+                softcam_reg = base_model.get_softcam_regularization()
                 if softcam_reg != 0.0:
                     loss = loss + softcam_reg
+        
+        ce_losses_m += ce_loss.item()
+        if softcam_aux_loss is not None:
+            aux_losses_m += cfg.softcam_aux_weight * softcam_aux_loss.item()
+        if softcam_reg is not None:
+            reg_losses_m += float(softcam_reg)
         
         # Scale loss for gradient accumulation
         loss = loss / grad_accum_steps
@@ -238,7 +254,14 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
     metrics['loss'] = avg_loss
     
     if getattr(cfg, 'is_main', True):
-        print(f"  Train: Loss={metrics['loss']:.4f}, QWK={metrics['qwk']:.4f}, Acc={metrics['accuracy']:.4f}, AUC={metrics['auc_macro']:.4f}")
+        nb = max(1, num_batches)
+        terms = [f'ce={ce_losses_m / nb:.4f}']
+        if cfg.use_softcam_decoder0:
+            terms.append(f'softcam-aux={aux_losses_m / nb:.4f}')
+        if reg_losses_m:
+            terms.append(f'softcam-reg={reg_losses_m / nb:.4f}')
+        print(f"  Train: Loss={metrics['loss']:.4f} ({', '.join(terms)}), "
+              f"QWK={metrics['qwk']:.4f}, Acc={metrics['accuracy']:.4f}, AUC={metrics['auc_macro']:.4f}")
         print(f"  AUC per class: {metrics['auc_per_class']}")
     
     if lr_scheduler is not None and not isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -283,9 +306,94 @@ def validate(model, loader, loss_fn, cfg, device, amp_autocast=suppress):
         print(f"  Valid: Loss={metrics['loss']:.4f}, QWK={metrics['qwk']:.4f}, Acc={metrics['accuracy']:.4f}, AUC={metrics['auc_macro']:.4f}, Kappa={metrics['kappa']:.4f}")
         print(f"  AUC per class: {metrics['auc_per_class']}")
         print(f"  Acc per class: {metrics['accuracy_per_class']}")
+        pred_counts = np.bincount(metrics['pred_labels'], minlength=cfg.num_classes)
+        print(f"  Val images predicted per class: {pred_counts.tolist()}")
         print(f"  Confusion Matrix:\n{metrics['confusion_matrix']}")
     
     return metrics
+
+
+# =============================================================================
+# DEBUG MODES & WEIGHT STATUS
+# =============================================================================
+def pretrained_weights_status(base_model, num_classes):
+    """Verify the timm rdnet_tiny backbone actually carries ImageNet weights.
+
+    The SegRDNet constructor hardcodes create_model('rdnet_tiny', pretrained=True);
+    this compares one backbone tensor against a from-scratch init to confirm
+    pretrained weights really differ from random init.
+    """
+    status = f'Pretrained backbone: timm rdnet_tiny (pretrained=True)'
+    try:
+        from models.rdnet import rdnet_tiny
+        scratch = rdnet_tiny(pretrained=False, num_classes=num_classes)
+        w_scratch = next(iter(scratch.state_dict().values())).detach().cpu()
+        w_model = next(iter(base_model.model.state_dict().values())).detach().cpu()
+        status += ': ImageNet weights loaded' if not torch.equal(w_scratch, w_model) \
+            else ': weights match a from-scratch init (pretrained weights may NOT have loaded)'
+    except Exception as exc:
+        status += f': could not verify ({exc})'
+    return status
+
+
+def tiny_overfit(cfg, model, optimizer, loss_fn, amp_autocast=suppress, loss_scaler=None):
+    """Overfit 64 val-transform images for 50 optimizer steps; report train accuracy.
+
+    Deliberately uses val transforms so accuracy is meaningful and overfitting
+    is achievable; if the loss does not collapse, something is broken.
+    """
+    csv_path = os.path.join(cfg.data_dir, cfg.train_csv)
+    img_dir = os.path.join(cfg.data_dir, cfg.train_img_dir)
+    dataset = APTOSDataset(csv_path, img_dir, transform=get_transforms(cfg.img_size, 'val'), mode='val')
+    n = min(64, len(dataset))
+    loader = DataLoader(
+        Subset(dataset, list(range(n))),
+        batch_size=min(cfg.batch_size, n),
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+    )
+
+    print(f'Tiny-overfit: {n} images (val transforms), 50 optimizer steps')
+    model.train()
+    steps, correct, seen, running_loss = 0, 0, 0, 0.0
+    while steps < 50:
+        for input, target in loader:
+            if steps >= 50:
+                break
+            input = input.to(cfg.device)
+            target = target.to(cfg.device)
+            optimizer.zero_grad()
+            with amp_autocast():
+                if cfg.use_softcam_decoder0:
+                    output, _, scale_logits = model(input, eval_mode=False)
+                    loss = loss_fn(output, target) + cfg.softcam_aux_weight * loss_fn(scale_logits[-1], target)
+                else:
+                    output = model(input)
+                    loss = loss_fn(output, target)
+            if loss_scaler is not None:
+                loss_scaler.scale(loss).backward()
+                if cfg.grad_clip:
+                    loss_scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                loss_scaler.step(optimizer)
+                loss_scaler.update()
+            else:
+                loss.backward()
+                if cfg.grad_clip:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                optimizer.step()
+            preds = output.argmax(dim=1)
+            correct += (preds == target).sum().item()
+            seen += target.size(0)
+            running_loss += loss.item()
+            steps += 1
+            if steps % 10 == 0:
+                print(f'  step {steps:02d}/50 | running loss {running_loss / steps:.3f} '
+                      f'| running train acc {correct / max(1, seen):.3f}')
+
+    print(f'tiny-overfit training accuracy over all 50 steps: '
+          f'{correct / max(1, seen):.4f} (mean loss {running_loss / steps:.4f})')
 
 
 # =============================================================================
@@ -371,6 +479,10 @@ class Config:
         # AMP
         self.amp = args.amp
         self.amp_dtype = args.amp_dtype
+        
+        # Debug / sanity modes
+        self.smoke = getattr(args, 'smoke', False)
+        self.tiny_overfit = getattr(args, 'tiny_overfit', False)
         
         # Output
         self.save_path = args.output
@@ -629,7 +741,15 @@ def parse_args():
     parser.add_argument('--resume', default=None, type=str,
                         help='Resume from a checkpoint: path to checkpoint.pt or its directory')
     
-    return parser.parse_args()
+    # Debug / sanity modes
+    parser.add_argument('--smoke', action='store_true', help='Train on 200 images, cap epochs at 2')
+    parser.add_argument('--tiny-overfit', action='store_true',
+                        help='Overfit 64 val-transform images for 50 optimizer steps; prints training accuracy')
+    
+    args = parser.parse_args()
+    if args.smoke:
+        args.epochs = min(args.epochs, 2)
+    return args
 
 
 def main():
@@ -647,6 +767,14 @@ def main():
     elif cfg.num_gpus > 1:
         print("  Only one GPU in use; launch via torch.distributed.run to use all GPUs")
     print(f"Epochs: {cfg.epochs}")
+    if cfg.smoke or cfg.tiny_overfit:
+        modes = []
+        if cfg.smoke:
+            modes.append('smoke (train capped at 200 imgs, epochs capped at 2)')
+        if cfg.tiny_overfit:
+            modes.append('tiny-overfit (64 imgs, 50 steps)')
+        print(f"Mode: {', '.join(modes)}")
+    print(f"Seed: {args.seed}")
     print(f"Batch Size: {cfg.batch_size}/GPU (effective: {cfg.batch_size * cfg.grad_accum_steps * cfg.world_size} with grad_accum={cfg.grad_accum_steps}, world={cfg.world_size})")
     print(f"Workers: {cfg.num_workers} (persistent: {cfg.persistent_workers})")
     print(f"Loss: CrossEntropy (label_smoothing={cfg.label_smoothing})")
@@ -706,6 +834,9 @@ def main():
     # Separate dataset instances so val transforms never leak into training images
     train_source = APTOSDataset(train_csv_path, train_img_dir, transform=train_transform, mode='train')
     val_source = APTOSDataset(train_csv_path, train_img_dir, transform=val_transform, mode='val')
+    if cfg.smoke and len(train_indices) > 200:
+        train_indices = train_indices[:200]
+        print('Smoke mode: training set capped at 200 images')
     train_dataset = Subset(train_source, train_indices)
     val_dataset = Subset(val_source, val_indices)
     
@@ -760,7 +891,11 @@ def main():
             print(f"Wrapped model in DistributedDataParallel (world_size={cfg.world_size})")
     
     if cfg.is_main:
-        print(f'Model: SegRDNet, Parameters: {sum(p.numel() for p in _unwrap_model(model).parameters()):,}')
+        base = _unwrap_model(model)
+        total_params = sum(p.numel() for p in base.parameters())
+        trainable_params = sum(p.numel() for p in base.parameters() if p.requires_grad)
+        print(f'Model: SegRDNet, Parameters: {total_params:,} | trainable: {trainable_params:,}')
+        print(pretrained_weights_status(base, cfg.num_classes))
     
     # Loss
     loss_fn = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing).to(cfg.device)
@@ -785,6 +920,16 @@ def main():
     
     # Training
     print('\nStarting training...')
+    
+    # Tiny-overfit sanity mode: overfit 64 images, report train accuracy, exit
+    if cfg.tiny_overfit:
+        tiny_overfit(cfg, model, optimizer, loss_fn, amp_autocast, loss_scaler)
+        logger.close()
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+        print('\nDone (tiny-overfit mode; skipping epoch training, checkpointing and submission).')
+        return 0
     
     # Resume: restore weights, optimizer, scheduler, best tracking and RNG states
     resume_state = None
