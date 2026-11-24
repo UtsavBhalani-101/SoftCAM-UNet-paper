@@ -94,36 +94,76 @@ def get_transforms(img_size=512, mode='train'):
 # =============================================================================
 # MODEL GENERATION (adapted from modules/builder.py)
 # =============================================================================
+PRETRAINED_WEIGHT_NAMES = {
+    'resnet50': 'ResNet50_Weights.IMAGENET1K_V1',
+    'resnet101': 'ResNet101_Weights.IMAGENET1K_V1',
+    'resnet152': 'ResNet152_Weights.IMAGENET1K_V1',
+    'densenet121': 'DenseNet121_Weights.IMAGENET1K_V1',
+    'densenet169': 'DenseNet169_Weights.IMAGENET1K_V1',
+    'efficientnet_b0': 'EfficientNet_B0_Weights.IMAGENET1K_V1',
+    'efficientnet_b3': 'EfficientNet_B3_Weights.IMAGENET1K_V1',
+}
+
+
+def get_pretrained_weights(network, pretrained):
+    """Resolve the torchvision weights enum for a network, or None."""
+    if not pretrained:
+        return None
+    weight_name = PRETRAINED_WEIGHT_NAMES.get(network)
+    if weight_name is None:
+        print(f'Warning: no pretrained weight mapping for {network}; training from scratch')
+        return None
+    return models.get_weight(weight_name)
+
+
+def pretrained_weights_status(cfg):
+    """Report whether pretrained weights were selected and are cached locally."""
+    if not cfg.pretrained:
+        return 'disabled (--no-pretrained); training from scratch'
+    weights = get_pretrained_weights(cfg.network, cfg.pretrained)
+    if weights is None:
+        return f'NOT LOADED: no weight mapping for network {cfg.network}'
+    try:
+        filename = weights.url.split('/')[-1]
+        cache_path = os.path.join(torch.hub.get_dir(), 'checkpoints', filename)
+        if os.path.isfile(cache_path):
+            return f'loaded ({filename} cached)'
+        return f'selected ({filename}) but not found in cache yet (downloads on first use)'
+    except Exception as exc:
+        return f'selected, cache check failed ({exc})'
+
+
 def generate_model(cfg):
     network = cfg.network
     num_classes = cfg.num_classes
     pretrained = cfg.pretrained
-    
+    weights = get_pretrained_weights(network, pretrained)
+
     # Load backbone from torchvision
     if network == 'resnet50':
-        model = models.resnet50(pretrained=pretrained)
+        model = models.resnet50(weights=weights)
         num_ftrs = model.fc.in_features
     elif network == 'resnet101':
-        model = models.resnet101(pretrained=pretrained)
+        model = models.resnet101(weights=weights)
         num_ftrs = model.fc.in_features
     elif network == 'resnet152':
-        model = models.resnet152(pretrained=pretrained)
+        model = models.resnet152(weights=weights)
         num_ftrs = model.fc.in_features
     elif network == 'densenet121':
-        model = models.densenet121(pretrained=pretrained)
+        model = models.densenet121(weights=weights)
         num_ftrs = model.classifier.in_features
     elif network == 'densenet169':
-        model = models.densenet169(pretrained=pretrained)
+        model = models.densenet169(weights=weights)
         num_ftrs = model.classifier.in_features
     elif network == 'efficientnet_b0':
-        model = models.efficientnet_b0(pretrained=pretrained)
+        model = models.efficientnet_b0(weights=weights)
         num_ftrs = model.classifier[-1].in_features
     elif network == 'efficientnet_b3':
-        model = models.efficientnet_b3(pretrained=pretrained)
+        model = models.efficientnet_b3(weights=weights)
         num_ftrs = model.classifier[-1].in_features
     elif network == 'bagnet33':
         print("BagNet not available, using resnet50")
-        model = models.resnet50(pretrained=pretrained)
+        model = models.resnet50(weights=weights)
         num_ftrs = model.fc.in_features
     else:
         raise ValueError(f'Unknown network: {network}')
@@ -388,6 +428,72 @@ def evaluate(cfg, model, loader, criterion):
 
 
 # =============================================================================
+# TINY-OVERFIT MODE
+# =============================================================================
+def tiny_overfit(cfg, model, optimizer, criterion):
+    """Overfit 64 val-transform images for 50 optimizer steps; report train accuracy.
+
+    Deliberately uses val transforms and no mixup so accuracy is meaningful and
+    overfitting is achievable; if the loss does not collapse, something is broken.
+    """
+    csv_path = os.path.join(cfg.data_dir, cfg.train_csv)
+    img_dir = os.path.join(cfg.data_dir, cfg.train_img_dir)
+    dataset = APTOSDataset(csv_path, img_dir, transform=get_transforms(cfg.img_size, 'val'), mode='val')
+    n = min(64, len(dataset))
+    loader = DataLoader(
+        Subset(dataset, list(range(n))),
+        batch_size=min(cfg.batch_size, n),
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+    )
+
+    print(f'Tiny-overfit: {n} images (val transforms, no mixup), 50 optimizer steps')
+    model.train()
+    steps, correct, seen, running_loss = 0, 0, 0, 0.0
+    while steps < 50:
+        for batch in loader:
+            if steps >= 50:
+                break
+            images = batch['image'].to(cfg.device)
+            targets = batch['target'].to(cfg.device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
+            loss = criterion(outputs, targets)
+            loss.backward()
+            if cfg.grad_clip:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            optimizer.step()
+            preds = outputs.argmax(dim=1)
+            correct += (preds == targets).sum().item()
+            seen += targets.size(0)
+            running_loss += loss.item()
+            steps += 1
+            if steps % 10 == 0:
+                print(f'  step {steps:02d}/50 | running ce {running_loss / steps:.3f} | running train acc {correct / max(1, seen):.3f}')
+
+    print(f'tiny-overfit training accuracy over all 50 steps: {correct / max(1, seen):.4f} (mean ce {running_loss / steps:.4f})')
+
+    # Eval-mode accuracy on the same 64 images
+    model.eval()
+    correct, seen, total_loss = 0, 0, 0.0
+    with torch.no_grad():
+        for batch in loader:
+            images = batch['image'].to(cfg.device)
+            targets = batch['target'].to(cfg.device)
+            outputs = model(images)
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
+            total_loss += criterion(outputs, targets).item() * targets.size(0)
+            correct += (outputs.argmax(dim=1) == targets).sum().item()
+            seen += targets.size(0)
+    print(f'tiny-overfit eval (train mode off) on the same {n} imgs: acc {correct / max(1, seen):.4f}, ce {total_loss / max(1, seen):.4f}')
+    return correct / max(1, seen)
+
+
+# =============================================================================
 # HEATMAP GENERATION (GradCAM-style)
 # =============================================================================
 def generate_heatmaps(cfg, model, save_path, num_samples=20):
@@ -519,6 +625,10 @@ class Config:
         # Output
         self.save_path = args.output
         self.generate_heatmaps = args.generate_heatmaps
+
+        # Modes
+        self.smoke = args.smoke
+        self.tiny_overfit = args.tiny_overfit
         
         # ============================================================
         # COMPATIBILITY LAYER for original SoftCAM modules
@@ -606,8 +716,17 @@ def parse_args():
     parser.add_argument('--output', default='/kaggle/working/softcam_aptos', type=str)
     parser.add_argument('--log-interval', default=20, type=int)
     parser.add_argument('--generate-heatmaps', action='store_true', default=True)
-    
-    return parser.parse_args()
+
+    # Modes
+    parser.add_argument('--smoke', action='store_true',
+                        help='Sanity run: train on 200 images for 2 epochs')
+    parser.add_argument('--tiny-overfit', action='store_true',
+                        help='Overfit check: train on 64 images for 50 optimizer steps, print training accuracy')
+
+    args = parser.parse_args()
+    if args.smoke:
+        args.epochs = min(args.epochs, 2)
+    return args
 
 
 def main():
@@ -627,6 +746,13 @@ def main():
     print(f"Pretrained: {cfg.pretrained}")
     print(f"Conv Classifier (heatmaps): {cfg.conv_cls}")
     print(f"Epochs: {cfg.epochs}")
+    if cfg.smoke or cfg.tiny_overfit:
+        modes = []
+        if cfg.smoke:
+            modes.append('smoke (train capped at 200 imgs)')
+        if cfg.tiny_overfit:
+            modes.append('tiny-overfit (64 imgs, 50 steps, no mixup)')
+        print(f"Mode: {', '.join(modes)}")
     print(f"Batch Size: {cfg.batch_size} (per GPU: {args.batch_size})")
     print(f"Val Batch Size: {cfg.val_batch_size} (per GPU: {args.val_batch_size})")
     print(f"Workers: {cfg.num_workers} (persistent: {cfg.persistent_workers})")
@@ -671,6 +797,9 @@ def main():
     train_size = int(0.8 * len(full_dataset))
     train_indices = indices[:train_size]
     val_indices = indices[train_size:]
+    if cfg.smoke and len(train_indices) > 200:
+        train_indices = train_indices[:200]
+        print('Smoke mode: training set capped at 200 images')
     
     # Separate dataset instances so val transforms never leak into training images
     train_source = APTOSDataset(train_csv_path, train_img_dir, transform=train_transform, mode='train')
@@ -716,16 +845,26 @@ def main():
     if cfg.num_gpus > 1:
         print(f"Using DataParallel on {cfg.num_gpus} GPUs")
         model = nn.DataParallel(model)
-    
-    print(f'Model: {cfg.network}, Parameters: {sum(p.numel() for p in model.parameters()):,}')
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Pretrained weights: {pretrained_weights_status(cfg)}')
+    print(f'Model: {cfg.network}, Parameters: {total_params:,} | trainable: {trainable_params:,}')
     
     # Loss, Optimizer, Scheduler
     criterion = get_loss_fn(cfg)
     optimizer = get_optimizer(cfg, model)
     scheduler = get_scheduler(cfg, optimizer, cfg.epochs)
-    
+
     # Training
     print('\nStarting training...')
+
+    if cfg.tiny_overfit:
+        tiny_overfit(cfg, model, optimizer, criterion)
+        logger.close()
+        print('\nDone (tiny-overfit mode; skipping epoch training, heatmaps and submission).')
+        return model, save_path
+
     best_metric = 0.0
     best_epoch = 0
     
