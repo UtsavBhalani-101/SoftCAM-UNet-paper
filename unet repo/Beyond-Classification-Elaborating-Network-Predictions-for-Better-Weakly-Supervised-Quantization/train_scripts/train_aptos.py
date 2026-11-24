@@ -315,6 +315,9 @@ def validate(model, loader, loss_fn, cfg, device, amp_autocast=suppress):
         print(f"  Acc per class: {metrics['accuracy_per_class']}")
         pred_counts = np.bincount(metrics['pred_labels'], minlength=cfg.num_classes)
         print(f"  Val images predicted per class: {pred_counts.tolist()}")
+        for grade in range(cfg.num_classes):
+            if pred_counts[grade] == 0:
+                print(f'  WARNING: grade {grade} never predicted')
         print(f"  Confusion Matrix:\n{metrics['confusion_matrix']}")
     
     return metrics
@@ -361,7 +364,21 @@ def tiny_overfit(cfg, model, optimizer, loss_fn, amp_autocast=suppress, loss_sca
         pin_memory=True,
     )
 
+    # The 64 images are the first rows of train.csv, which is not class-balanced;
+    # if these are mostly grade 0, a collapsed (majority-class) model already
+    # scores that share as accuracy. Print the composition to interpret the cap.
+    subset_labels = np.bincount([int(dataset[i][1]) for i in range(n)], minlength=cfg.num_classes)
     print(f'Tiny-overfit: {n} images (val transforms), 50 optimizer steps')
+    print(f'  class distribution of those {n} images: {subset_labels.tolist()}')
+
+    # Diagnostic plumbing test: the training lr (1e-4) is far too small to
+    # collapse the loss in only 50 steps on this fresh 4-decoder stack. Raise
+    # it so the mode can actually prove gradients flow; the run exits right
+    # after, so nothing downstream is affected.
+    overfit_lr = max(cfg.lr, 1e-3)
+    for group in optimizer.param_groups:
+        group['lr'] = overfit_lr
+    print(f'  tiny-overfit LR override: {cfg.lr} -> {overfit_lr}')
     model.train()
     steps, correct, seen, running_loss = 0, 0, 0, 0.0
     while steps < 50:
@@ -543,6 +560,10 @@ def init_distributed():
         world_size = dist.get_world_size()
         device = torch.device('cuda', int(os.environ.get('LOCAL_RANK', 0))) if torch.cuda.is_available() \
             else torch.device('cpu')
+        name = torch.cuda.get_device_name(device) if device.type == 'cuda' else 'cpu'
+        # Every rank prints, so the log itself proves how many processes/GPUs ran
+        print(f"[rank {rank}/{world_size}] using {device} ({name}); "
+              f"visible cuda devices: {torch.cuda.device_count()}", flush=True)
     else:
         rank, world_size = 0, 1
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -949,7 +970,7 @@ def main():
             raise SystemExit(f'Resume checkpoint not found: {resume_path}')
         resume_state = load_checkpoint(resume_path, model, optimizer, scheduler, cfg.device)
         start_epoch = resume_state['epoch'] + 1
-        best_metric = resume_state.get('best_metric', 0.0)
+        best_metric = resume_state.get('best_metric', float('-inf'))
         best_epoch = resume_state.get('best_epoch', 0)
         if resume_state.get('config') and resume_state['config'].get('use_softcam_decoder0') != cfg.use_softcam_decoder0:
             print(f"WARNING: checkpoint was trained with use_softcam_decoder0="
@@ -959,7 +980,9 @@ def main():
               f'(best QWK so far {best_metric:.4f} at epoch {best_epoch}). '
               f'Use the same --seed to reproduce the split.')
     else:
-        best_metric = 0.0
+        # -inf so the first epoch always snapshots best_model.pth, even when
+        # early QWK is 0 or negative (untrained models can predict one class)
+        best_metric = float('-inf')
         best_epoch = 0
 
     run = init_wandb(args, resume_state=resume_state) if cfg.is_main else None
@@ -1035,10 +1058,16 @@ def main():
                 persistent_workers=cfg.persistent_workers,
             )
         
-        # Final evaluation with best model
+        # Final evaluation with best model (fall back to current weights if
+        # best_model.pth was never written, e.g. QWK stayed <= 0 every epoch)
         print('\n=== Final Evaluation (Best Model) ===')
-        best_state = torch.load(os.path.join(save_path, 'best_model.pth'), map_location=cfg.device)
-        _unwrap_model(model).load_state_dict(best_state)
+        best_model_path = os.path.join(save_path, 'best_model.pth')
+        if os.path.isfile(best_model_path):
+            best_state = torch.load(best_model_path, map_location=cfg.device)
+            _unwrap_model(model).load_state_dict(best_state)
+        else:
+            print('WARNING: best_model.pth was never saved (validation QWK never '
+                  'exceeded the initial best); evaluating the current weights instead.')
         final_metrics = validate(model, val_loader, loss_fn, cfg, cfg.device, amp_autocast)
         print(f"FINAL: QWK={final_metrics['qwk']:.4f}, Acc={final_metrics['accuracy']:.4f}, AUC={final_metrics['auc_macro']:.4f}")
         print(f"Confusion Matrix:\n{final_metrics['confusion_matrix']}")
