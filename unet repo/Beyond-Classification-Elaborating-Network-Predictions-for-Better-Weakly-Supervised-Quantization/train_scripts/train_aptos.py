@@ -24,9 +24,11 @@ from functools import partial
 from sklearn.metrics import cohen_kappa_score, confusion_matrix, classification_report
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.nn.parallel import DistributedDataParallel as NativeDDP
+from torch.utils.data import Dataset, DataLoader, random_split, Subset, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
 import torchvision.transforms as T
@@ -206,7 +208,7 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
         all_predictions.append(output.detach())
         all_targets.append(target.detach())
         
-        if batch_idx % cfg.log_interval == 0:
+        if batch_idx % cfg.log_interval == 0 and getattr(cfg, 'is_main', True):
             print(f'Epoch {epoch} [{batch_idx}/{len(loader)}] Loss: {loss.item() * grad_accum_steps:.4f}')
     
     # Handle remaining gradients
@@ -227,11 +229,17 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
     p_test = torch.cat(all_predictions, dim=0)
     y_test = torch.cat(all_targets, dim=0)
     
-    metrics = compute_all_metrics(p_test, y_test, cfg.num_classes)
+    metrics = global_metrics(p_test, y_test, cfg)
+    if dist.is_available() and dist.is_initialized():
+        # Average per-rank epoch losses into one global number on every rank
+        loss_t = torch.tensor([avg_loss], device=p_test.device)
+        dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
+        avg_loss = loss_t.item()
     metrics['loss'] = avg_loss
     
-    print(f"  Train: Loss={metrics['loss']:.4f}, QWK={metrics['qwk']:.4f}, Acc={metrics['accuracy']:.4f}, AUC={metrics['auc_macro']:.4f}")
-    print(f"  AUC per class: {metrics['auc_per_class']}")
+    if getattr(cfg, 'is_main', True):
+        print(f"  Train: Loss={metrics['loss']:.4f}, QWK={metrics['qwk']:.4f}, Acc={metrics['accuracy']:.4f}, AUC={metrics['auc_macro']:.4f}")
+        print(f"  AUC per class: {metrics['auc_per_class']}")
     
     if lr_scheduler is not None and not isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
         lr_scheduler.step()
@@ -264,13 +272,18 @@ def validate(model, loader, loss_fn, cfg, device, amp_autocast=suppress):
     p_test = torch.cat(all_predictions, dim=0)
     y_test = torch.cat(all_targets, dim=0)
     
-    metrics = compute_all_metrics(p_test, y_test, cfg.num_classes)
+    metrics = global_metrics(p_test, y_test, cfg)
+    if dist.is_available() and dist.is_initialized():
+        loss_t = torch.tensor([avg_loss], device=p_test.device)
+        dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
+        avg_loss = loss_t.item()
     metrics['loss'] = avg_loss
     
-    print(f"  Valid: Loss={metrics['loss']:.4f}, QWK={metrics['qwk']:.4f}, Acc={metrics['accuracy']:.4f}, AUC={metrics['auc_macro']:.4f}, Kappa={metrics['kappa']:.4f}")
-    print(f"  AUC per class: {metrics['auc_per_class']}")
-    print(f"  Acc per class: {metrics['accuracy_per_class']}")
-    print(f"  Confusion Matrix:\n{metrics['confusion_matrix']}")
+    if getattr(cfg, 'is_main', True):
+        print(f"  Valid: Loss={metrics['loss']:.4f}, QWK={metrics['qwk']:.4f}, Acc={metrics['accuracy']:.4f}, AUC={metrics['auc_macro']:.4f}, Kappa={metrics['kappa']:.4f}")
+        print(f"  AUC per class: {metrics['auc_per_class']}")
+        print(f"  Acc per class: {metrics['accuracy_per_class']}")
+        print(f"  Confusion Matrix:\n{metrics['confusion_matrix']}")
     
     return metrics
 
@@ -312,9 +325,10 @@ def generate_submission(cfg, model, save_path, val_transform):
 # =============================================================================
 class Config:
     def __init__(self, args):
-        # Device detection - simple check
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        # One process per GPU (DDP via torchrun); plain launch = single process
+        self.rank, self.world_size, self.device = init_distributed()
+        self.is_main = self.rank == 0
+        self.num_gpus = self.world_size if self.device.type == 'cuda' else 0
         
         # Data paths
         self.data_dir = args.data_dir
@@ -324,13 +338,14 @@ class Config:
         self.test_img_dir = args.test_img_dir
         self.img_size = args.img_size
         
-        # Training - single GPU for SegRDNet (hooks incompatible with DataParallel)
-        # Reduced batch size for 512x512 on T4 16GB
+        # Per-GPU batch size: SegRDNet hooks prevent DataParallel, so with DDP
+        # each process runs its own replica; cap per-step batch at 8 for 512x512
+        # on T4 16GB and compensate with gradient accumulation across the fleet.
         self.batch_size = min(args.batch_size, 8)
         self.val_batch_size = min(args.val_batch_size, 16)
         
-        # Gradient accumulation to maintain effective batch size
-        self.grad_accum_steps = max(1, args.batch_size // self.batch_size)
+        # Gradient accumulation to maintain the target effective batch size
+        self.grad_accum_steps = max(1, round(args.batch_size / (self.batch_size * self.world_size)))
         self.num_workers = args.workers
         self.persistent_workers = True if args.workers > 0 else False
         self.num_classes = args.num_classes
@@ -373,6 +388,185 @@ def set_random_seed(seed):
 def load_save_paths(cfg):
     save_path = os.path.join(cfg.save_path, 'segrdnet', datetime.now().strftime("%Y%m%d-%H%M%S"))
     return save_path
+
+
+# =============================================================================
+# WANDB & CHECKPOINT HELPERS
+# =============================================================================
+def per_class_recall(conf_mat):
+    """Recall per class from a confusion matrix (0 when a class has no GT samples)."""
+    support = conf_mat.sum(axis=1)
+    return np.divide(np.diag(conf_mat), support, out=np.zeros_like(np.diag(conf_mat), dtype=float), where=support > 0)
+
+
+def _unwrap_model(model):
+    """Return the underlying module for DDP/DataParallel wrappers."""
+    if isinstance(model, (NativeDDP, nn.DataParallel)):
+        return model.module
+    return model
+
+
+def init_distributed():
+    """Initialize one process per GPU (launched via torchrun / torch.distributed.run).
+
+    torchrun sets RANK/WORLD_SIZE/LOCAL_RANK; with a plain `python` launch this
+    falls back to single-process execution on cuda:0.
+    """
+    if dist.is_available() and not dist.is_initialized() and 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            dist.init_process_group(backend='nccl')
+        else:
+            dist.init_process_group(backend='gloo')
+    if dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = torch.device('cuda', int(os.environ.get('LOCAL_RANK', 0))) if torch.cuda.is_available() \
+            else torch.device('cpu')
+    else:
+        rank, world_size = 0, 1
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    return rank, world_size, device
+
+
+def gather_tensor(tensor):
+    """All-gather variable-sized tensors (padded) and concatenate; identical result on every rank."""
+    if not (dist.is_available() and dist.is_initialized()):
+        return tensor
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return tensor
+    local_n = torch.tensor([tensor.shape[0]], device=tensor.device)
+    sizes = [torch.zeros_like(local_n) for _ in range(world_size)]
+    dist.all_gather(sizes, local_n)
+    max_n = int(max(s.item() for s in sizes))
+    if max_n > tensor.shape[0]:
+        fill = -1 if tensor.dtype == torch.long else 0.0
+        pad = tensor.new_full((max_n - tensor.shape[0], *tensor.shape[1:]), fill)
+        tensor = torch.cat([tensor, pad], dim=0)
+    gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, tensor.contiguous())
+    return torch.cat(gathered, dim=0)
+
+
+def global_metrics(p_test, y_test, cfg):
+    """Concatenate local predictions/targets across ranks and compute dataset-wide metrics."""
+    y_test = gather_tensor(y_test)
+    p_test = gather_tensor(p_test)
+    valid = y_test >= 0  # padded slots only exist in the target tensor
+    y_test = y_test[valid]
+    p_test = p_test[valid[:p_test.shape[0]]]
+    return compute_all_metrics(p_test, y_test, cfg.num_classes)
+
+
+def init_wandb(args, resume_state=None):
+    """Start a wandb run when --wandb is set; on resume, continue the same run id."""
+    if not args.wandb:
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise SystemExit('--wandb requires the wandb package: pip install wandb') from exc
+    run_id = resume_state.get('wandb_run_id') if resume_state else None
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        config=vars(args),
+        id=run_id,
+        resume='must' if run_id else None,
+    )
+    return run
+
+
+def wandb_log_epoch(run, epoch, lr, secs, train_loss, val_loss, train_metrics, val_metrics, num_classes):
+    if run is None:
+        return
+    import wandb
+    cm = val_metrics['confusion_matrix']
+    recall = per_class_recall(cm)
+    pred_counts = np.bincount(val_metrics['pred_labels'], minlength=num_classes)
+    payload = {
+        'epoch': epoch,
+        'lr': lr,
+        'epoch_time_s': secs,
+        'loss/train_ce': train_loss,
+        'loss/val_ce': val_loss,
+        'train_eval/qwk': train_metrics['qwk'],
+        'train_eval/accuracy': train_metrics['accuracy'],
+        'train_eval/auc_macro': train_metrics['auc_macro'],
+        'val/qwk': val_metrics['qwk'],
+        'val/accuracy': val_metrics['accuracy'],
+        'val/loss': val_metrics['loss'],
+        'val/auc_macro': val_metrics['auc_macro'],
+        'val/kappa': val_metrics['kappa'],
+    }
+    for grade in range(num_classes):
+        payload[f'val/recall_grade_{grade}'] = float(recall[grade])
+        payload[f'val/pred_count_grade_{grade}'] = int(pred_counts[grade])
+    table = wandb.Table(columns=['gt\\pred'] + [str(i) for i in range(num_classes)])
+    for i in range(num_classes):
+        table.add_data(str(i), *[int(v) for v in cm[i]])
+    payload['val/confusion_matrix'] = table
+    run.log(payload, step=epoch)
+
+
+def save_checkpoint(ckpt_path, args, model, optimizer, scheduler, epoch,
+                    best_metric, best_epoch, wandb_run_id=None):
+    """Atomically save everything needed to resume as if the run never stopped."""
+    model_to_use = _unwrap_model(model)
+    state = {
+        'epoch': epoch,  # last completed epoch
+        'model': model_to_use.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict() if scheduler is not None else None,
+        'best_metric': best_metric,
+        'best_epoch': best_epoch,
+        'wandb_run_id': wandb_run_id,
+        'config': {
+            'model': 'SegRDNet', 'pooling': args.pooling, 'num_classes': args.num_classes,
+            'img_size': args.img_size, 'optimizer': args.optimizer, 'lr': args.lr,
+            'weight_decay': args.weight_decay, 'scheduler_name': args.scheduler,
+            'label_smoothing': args.label_smoothing, 'batch_size': args.batch_size,
+            'use_softcam_decoder0': args.use_softcam_decoder0,
+        },
+        'rng': {
+            'torch': torch.get_rng_state(),
+            'numpy': np.random.get_state(),
+            'python': random.getstate(),
+            'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+    }
+    tmp_path = ckpt_path + '.tmp'
+    torch.save(state, tmp_path)
+    os.replace(tmp_path, ckpt_path)
+    return ckpt_path
+
+
+def load_checkpoint(path, model, optimizer, scheduler, device):
+    """Restore model/optimizer/scheduler and RNG states; returns the raw state dict."""
+    model_to_use = _unwrap_model(model)
+    state = torch.load(path, map_location='cpu', weights_only=False)
+    model_to_use.load_state_dict(state['model'])
+    model_to_use.to(device)
+    if optimizer is not None and state.get('optimizer'):
+        optimizer.load_state_dict(state['optimizer'])
+    if scheduler is not None and state.get('scheduler'):
+        scheduler.load_state_dict(state['scheduler'])
+    rng = state.get('rng') or {}
+    if rng.get('torch') is not None:
+        torch.set_rng_state(rng['torch'])
+    if rng.get('numpy') is not None:
+        np.random.set_state(rng['numpy'])
+    if rng.get('python') is not None:
+        random.setstate(rng['python'])
+    if rng.get('cuda') is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(rng['cuda'])
+        except Exception as exc:
+            print(f'Warning: could not restore CUDA RNG state: {exc}')
+    return state
 
 
 # =============================================================================
@@ -427,6 +621,14 @@ def parse_args():
     parser.add_argument('--no-amp', dest='amp', action='store_false')
     parser.add_argument('--amp-dtype', default='float16', type=str)
     
+    # wandb / resume
+    parser.add_argument('--wandb', action='store_true', help='Log per-epoch metrics to Weights & Biases')
+    parser.add_argument('--wandb-project', default='MICCAI', type=str)
+    parser.add_argument('--wandb-entity', default=None, type=str)
+    parser.add_argument('--wandb-run-name', default=None, type=str)
+    parser.add_argument('--resume', default=None, type=str,
+                        help='Resume from a checkpoint: path to checkpoint.pt or its directory')
+    
     return parser.parse_args()
 
 
@@ -439,11 +641,13 @@ def main():
     print("CHEN'S UNET (SegRDNet) APTOS TRAINING CONFIG")
     print("="*60)
     print(f"Device: {cfg.device}")
-    print(f"GPUs available: {cfg.num_gpus}")
-    if cfg.num_gpus > 0:
-        print(f"  Using single GPU (cuda:0) - SegRDNet hooks incompatible with DataParallel")
+    print(f"Processes: {cfg.world_size} (rank {cfg.rank}); GPUs available: {cfg.num_gpus}")
+    if cfg.world_size > 1:
+        print("  DistributedDataParallel: one process per GPU (forward hooks are per-process, hook-safe)")
+    elif cfg.num_gpus > 1:
+        print("  Only one GPU in use; launch via torch.distributed.run to use all GPUs")
     print(f"Epochs: {cfg.epochs}")
-    print(f"Batch Size: {cfg.batch_size} (effective: {cfg.batch_size * getattr(cfg, 'grad_accum_steps', 1)} with grad_accum={getattr(cfg, 'grad_accum_steps', 1)})")
+    print(f"Batch Size: {cfg.batch_size}/GPU (effective: {cfg.batch_size * cfg.grad_accum_steps * cfg.world_size} with grad_accum={cfg.grad_accum_steps}, world={cfg.world_size})")
     print(f"Workers: {cfg.num_workers} (persistent: {cfg.persistent_workers})")
     print(f"Loss: CrossEntropy (label_smoothing={cfg.label_smoothing})")
     
@@ -456,13 +660,25 @@ def main():
         print(f"SoftCAM Decoder 0: DISABLED (baseline)")
     
     print(f"Output: {cfg.save_path}")
+    print(f"wandb: {'on, project ' + args.wandb_project + (f' (entity {args.wandb_entity})' if args.wandb_entity else '') if args.wandb else 'off'}")
+    print(f"Resume: {args.resume or 'no (fresh run)'}")
     print("="*60)
     
-    set_random_seed(args.seed)
+    # Rank-offset seed for augmentation diversity; the split below uses an
+    # explicit generator so it is identical on every rank
+    set_random_seed(args.seed + cfg.rank)
     
     save_path = load_save_paths(cfg)
+    if cfg.world_size > 1:
+        # Each rank stamps its own timestamp; agree on rank 0's so all ranks
+        # read/write the same run directory
+        holder = [save_path]
+        dist.broadcast_object_list(holder, src=0)
+        save_path = holder[0]
+        print(f'Save path (broadcast from rank 0): {save_path}')
+    else:
+        print(f'Save path: {save_path}')
     os.makedirs(save_path, exist_ok=True)
-    print(f'Save path: {save_path}')
     
     logger = SummaryWriter(save_path)
     
@@ -480,19 +696,31 @@ def main():
     train_csv_path = os.path.join(cfg.data_dir, cfg.train_csv)
     train_img_dir = os.path.join(cfg.data_dir, cfg.train_img_dir)
     
-    full_dataset = APTOSDataset(train_csv_path, train_img_dir, transform=train_transform, mode='train')
+    full_dataset = APTOSDataset(train_csv_path, train_img_dir, transform=None, mode='train')
+    split_rng = torch.Generator().manual_seed(args.seed)
+    indices = torch.randperm(len(full_dataset), generator=split_rng).tolist()
     train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
-    val_dataset.dataset.transform = val_transform
-    val_dataset.dataset.mode = 'val'
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:]
+    
+    # Separate dataset instances so val transforms never leak into training images
+    train_source = APTOSDataset(train_csv_path, train_img_dir, transform=train_transform, mode='train')
+    val_source = APTOSDataset(train_csv_path, train_img_dir, transform=val_transform, mode='val')
+    train_dataset = Subset(train_source, train_indices)
+    val_dataset = Subset(val_source, val_indices)
     
     print(f'Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}')
     
+    # Shard the split across ranks when running DDP
+    train_sampler = DistributedSampler(train_dataset, num_replicas=cfg.world_size, rank=cfg.rank,
+                                       shuffle=True, seed=args.seed) if cfg.world_size > 1 else None
+    val_sampler = DistributedSampler(val_dataset, num_replicas=cfg.world_size, rank=cfg.rank,
+                                     shuffle=False) if cfg.world_size > 1 else None
     train_loader = DataLoader(
         train_dataset, 
         batch_size=cfg.batch_size, 
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=cfg.num_workers, 
         pin_memory=True, 
         drop_last=True,
@@ -502,6 +730,7 @@ def main():
         val_dataset, 
         batch_size=cfg.val_batch_size, 
         shuffle=False,
+        sampler=val_sampler,
         num_workers=cfg.num_workers, 
         pin_memory=True,
         persistent_workers=cfg.persistent_workers
@@ -519,15 +748,19 @@ def main():
     
     model.to(cfg.device)
     
-    # NOTE: SegRDNet uses forward hooks for multi-scale feature extraction
-    # which are incompatible with nn.DataParallel.
-    # Use single GPU (will use GPU 0). For multi-GPU, consider DDP instead.
-    if cfg.num_gpus > 1:
-        print(f"Multiple GPUs detected ({cfg.num_gpus}), but SegRDNet uses forward hooks")
-        print("  incompatible with DataParallel. Using single GPU (cuda:0).")
-        print("  For multi-GPU training, use DistributedDataParallel (DDP) instead.")
+    # SegRDNet reads intermediate features from self.activation, populated by
+    # forward-hook closures bound to `self`. DataParallel replicates the module
+    # per device but runs all replicas as threads in ONE process sharing this
+    # object, so those writes race across GPUs. DDP gives each GPU its own
+    # process and replica, keeping the hook payloads local and consistent.
+    if cfg.world_size > 1:
+        model = NativeDDP(model, device_ids=[cfg.device.index] if cfg.device.type == 'cuda' else None,
+                          find_unused_parameters=True)
+        if cfg.is_main:
+            print(f"Wrapped model in DistributedDataParallel (world_size={cfg.world_size})")
     
-    print(f'Model: SegRDNet, Parameters: {sum(p.numel() for p in model.parameters()):,}')
+    if cfg.is_main:
+        print(f'Model: SegRDNet, Parameters: {sum(p.numel() for p in _unwrap_model(model).parameters()):,}')
     
     # Loss
     loss_fn = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing).to(cfg.device)
@@ -552,11 +785,38 @@ def main():
     
     # Training
     print('\nStarting training...')
-    best_metric = 0.0
-    best_epoch = 0
     
-    for epoch in range(cfg.epochs):
+    # Resume: restore weights, optimizer, scheduler, best tracking and RNG states
+    resume_state = None
+    start_epoch = 0
+    if args.resume:
+        resume_path = args.resume
+        if os.path.isdir(resume_path):
+            resume_path = os.path.join(resume_path, 'checkpoint.pt')
+        if not os.path.isfile(resume_path):
+            raise SystemExit(f'Resume checkpoint not found: {resume_path}')
+        resume_state = load_checkpoint(resume_path, model, optimizer, scheduler, cfg.device)
+        start_epoch = resume_state['epoch'] + 1
+        best_metric = resume_state.get('best_metric', 0.0)
+        best_epoch = resume_state.get('best_epoch', 0)
+        if resume_state.get('config') and resume_state['config'].get('use_softcam_decoder0') != cfg.use_softcam_decoder0:
+            print(f"WARNING: checkpoint was trained with use_softcam_decoder0="
+                  f"{resume_state['config'].get('use_softcam_decoder0')}, "
+                  f"current value is {cfg.use_softcam_decoder0}")
+        print(f'Resumed from {resume_path}: continuing at epoch {start_epoch} '
+              f'(best QWK so far {best_metric:.4f} at epoch {best_epoch}). '
+              f'Use the same --seed to reproduce the split.')
+    else:
+        best_metric = 0.0
+        best_epoch = 0
+
+    run = init_wandb(args, resume_state=resume_state) if cfg.is_main else None
+    wandb_run_id = run.id if run is not None else None
+
+    for epoch in range(start_epoch, cfg.epochs):
         epoch_start = time.time()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         
         train_metrics = train_one_epoch(epoch, model, train_loader, optimizer, loss_fn, 
                                        cfg, cfg.device, scheduler, amp_autocast, loss_scaler)
@@ -572,36 +832,74 @@ def main():
         logger.add_scalar('QWK/val', val_metrics['qwk'], epoch)
         logger.add_scalar('Kappa/val', val_metrics['kappa'], epoch)
         
-        # Save best model (by QWK)
+        # Save best model (by QWK); metrics are global, so all ranks agree here
         metric = val_metrics['qwk']
         if metric > best_metric:
             best_metric = metric
             best_epoch = epoch
-            state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-            torch.save(state_dict, os.path.join(save_path, 'best_model.pth'))
-            print(f'  -> Best model saved (QWK: {best_metric:.4f})')
+            if cfg.is_main:
+                torch.save(_unwrap_model(model).state_dict(), os.path.join(save_path, 'best_model.pth'))
+                print(f'  -> Best model saved (QWK: {best_metric:.4f})')
         
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step(metric)
+        
+        # Rolling resume checkpoint + wandb metrics for this epoch (rank 0 only)
+        lr_now = optimizer.param_groups[0]['lr']
+        secs = time.time() - epoch_start
+        if cfg.is_main:
+            save_checkpoint(
+                os.path.join(save_path, 'checkpoint.pt'), args, model, optimizer, scheduler,
+                epoch, best_metric, best_epoch, wandb_run_id=wandb_run_id,
+            )
+            wandb_log_epoch(
+                run, epoch, lr_now, secs, train_metrics['loss'], val_metrics['loss'],
+                train_metrics, val_metrics, cfg.num_classes,
+            )
     
-    print(f'\n{"="*60}')
-    print(f'Best validation QWK: {best_metric:.4f} at epoch {best_epoch}')
-    print(f'{"="*60}')
+    if run is not None:
+        run.finish()
     
-    # Final evaluation with best model
-    print('\n=== Final Evaluation (Best Model) ===')
-    best_state = torch.load(os.path.join(save_path, 'best_model.pth'), map_location=cfg.device)
-    model.load_state_dict(best_state)
-    final_metrics = validate(model, val_loader, loss_fn, cfg, cfg.device, amp_autocast)
-    print(f"FINAL: QWK={final_metrics['qwk']:.4f}, Acc={final_metrics['accuracy']:.4f}, AUC={final_metrics['auc_macro']:.4f}")
-    print(f"Confusion Matrix:\n{final_metrics['confusion_matrix']}")
+    # All ranks are done training: sync once, then tear down the process group
+    # before the rank-0 final evaluation (no collectives may run after this)
+    is_distributed = dist.is_available() and dist.is_initialized()
+    if is_distributed:
+        dist.barrier()
+        dist.destroy_process_group()
     
-    # Generate submission
-    print('\nGenerating submission...')
-    generate_submission(cfg, model, save_path, val_transform)
-    
-    logger.close()
-    print('\nDone!')
+    if cfg.is_main:
+        print(f'\n{"="*60}')
+        print(f'Best validation QWK: {best_metric:.4f} at epoch {best_epoch}')
+        print(f'{"="*60}')
+        
+        # Full (non-sharded) val loader so final metrics cover the whole split
+        if is_distributed:
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=cfg.val_batch_size,
+                shuffle=False,
+                num_workers=cfg.num_workers,
+                pin_memory=True,
+                persistent_workers=cfg.persistent_workers,
+            )
+        
+        # Final evaluation with best model
+        print('\n=== Final Evaluation (Best Model) ===')
+        best_state = torch.load(os.path.join(save_path, 'best_model.pth'), map_location=cfg.device)
+        _unwrap_model(model).load_state_dict(best_state)
+        final_metrics = validate(model, val_loader, loss_fn, cfg, cfg.device, amp_autocast)
+        print(f"FINAL: QWK={final_metrics['qwk']:.4f}, Acc={final_metrics['accuracy']:.4f}, AUC={final_metrics['auc_macro']:.4f}")
+        print(f"Confusion Matrix:\n{final_metrics['confusion_matrix']}")
+        
+        # Generate submission
+        print('\nGenerating submission...')
+        generate_submission(cfg, model, save_path, val_transform)
+        
+        logger.close()
+        if is_distributed:
+            print('\nDone! (Distributed: rank 0 wrote all outputs; other ranks exited earlier.)')
+        else:
+            print('\nDone!')
 
 
 if __name__ == '__main__':
