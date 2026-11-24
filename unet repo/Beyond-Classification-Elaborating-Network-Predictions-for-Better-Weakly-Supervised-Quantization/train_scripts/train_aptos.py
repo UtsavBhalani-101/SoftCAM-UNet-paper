@@ -393,6 +393,7 @@ def tiny_overfit(cfg, model, optimizer, loss_fn, amp_autocast=suppress, loss_sca
     print(f'  tiny-overfit LR override: {cfg.lr} -> {overfit_lr}')
     model.train()
     steps, correct, seen, running_loss = 0, 0, 0, 0.0
+    w_correct, w_seen, w_loss = 0, 0, 0.0
     while steps < total_steps:
         for input, target in loader:
             if steps >= total_steps:
@@ -420,16 +421,57 @@ def tiny_overfit(cfg, model, optimizer, loss_fn, amp_autocast=suppress, loss_sca
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
                 optimizer.step()
             preds = output.argmax(dim=1)
-            correct += (preds == target).sum().item()
+            hit = (preds == target).sum().item()
+            correct += hit
             seen += target.size(0)
             running_loss += loss.item()
+            w_correct += hit
+            w_seen += target.size(0)
+            w_loss += loss.item()
             steps += 1
             if steps % 10 == 0:
-                print(f'  step {steps:02d}/{total_steps} | running loss {running_loss / steps:.3f} '
-                      f'| running train acc {correct / max(1, seen):.3f}')
+                print(f'  step {steps:02d}/{total_steps} | last-10-steps loss {w_loss / max(1, w_seen):.3f} '
+                      f'| acc {w_correct / max(1, w_seen):.3f}')
+                w_correct, w_seen, w_loss = 0, 0, 0.0
 
     print(f'tiny-overfit training accuracy over all {total_steps} steps: '
           f'{correct / max(1, seen):.4f} (mean loss {running_loss / steps:.4f})')
+
+    # Eval-mode pass on the same images: train-mode acc can hide dropout/BN
+    # artifacts; this is the actual "can the model memorize" number.
+    model.eval()
+    eval_correct, eval_seen, eval_loss = 0, 0, 0.0
+    with torch.no_grad():
+        for input, target in loader:
+            input = input.to(cfg.device)
+            target = target.to(cfg.device)
+            with amp_autocast():
+                if cfg.use_softcam_decoder0:
+                    output, _, _ = model(input, eval_mode=False)
+                else:
+                    output = model(input)
+            eval_loss += loss_fn(output, target).item() * target.size(0)
+            eval_correct += (output.argmax(dim=1) == target).sum().item()
+            eval_seen += target.size(0)
+    eval_acc = eval_correct / max(1, eval_seen)
+    print(f'tiny-overfit eval (train mode off) on the same {n} imgs: '
+          f'acc {eval_acc:.4f}, loss {eval_loss / max(1, eval_seen):.4f}')
+
+    # Verdict: compare against the share of the biggest class. Accuracy stuck
+    # at that share means "still majority-collapsed", not "implementation is
+    # wrong" — a genuinely broken pipeline also reads exactly like that, so
+    # the discriminator is the step budget, stated explicitly here.
+    biggest_share = int(subset_labels.max()) / max(1, n)
+    if eval_acc >= 0.90:
+        print('  tiny-overfit verdict: PASS — the model memorized the subset; '
+              'loss/gradients/pipeline are sound.')
+    elif eval_acc <= biggest_share + 0.05:
+        print(f'  tiny-overfit verdict: INCONCLUSIVE — acc sits at the biggest-class '
+              f'share ({biggest_share:.3f}); the model has not had enough steps yet. '
+              f'Rerun with --tiny-overfit-steps {max(250, total_steps * 3)}.')
+    else:
+        print('  tiny-overfit verdict: WEAK — learning above chance but not memorizing; '
+              f'rerun with --tiny-overfit-steps {max(250, total_steps * 3)} before concluding anything.')
 
 
 # =============================================================================
