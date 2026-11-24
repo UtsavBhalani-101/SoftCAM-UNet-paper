@@ -589,6 +589,123 @@ def generate_submission(cfg, model, save_path):
 
 
 # =============================================================================
+# WANDB & CHECKPOINTS
+# =============================================================================
+def init_wandb(args, resume_state=None):
+    """Start a wandb run when --wandb is set; on resume, continue the same run id."""
+    if not args.wandb:
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise SystemExit('--wandb requires the wandb package: pip install wandb') from exc
+    run_id = resume_state.get('wandb_run_id') if resume_state else None
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        config=vars(args),
+        id=run_id,
+        resume='must' if run_id else None,
+    )
+    return run
+
+
+def wandb_log_epoch(run, epoch, lr, secs, train_loss, val_loss,
+                    train_eval_metrics, val_metrics, num_classes):
+    if run is None:
+        return
+    import wandb
+    cm = val_metrics['confusion_matrix']
+    recall = per_class_recall(cm)
+    pred_counts = np.bincount(val_metrics['pred_labels'], minlength=num_classes)
+    payload = {
+        'epoch': epoch,
+        'lr': lr,
+        'epoch_time_s': secs,
+        'loss/train_ce': train_loss,
+        'loss/val_ce': val_loss,
+        'train_eval/qwk': train_eval_metrics['qwk'],
+        'train_eval/accuracy': train_eval_metrics['accuracy'],
+        'train_eval/auc_macro': train_eval_metrics['auc_macro'],
+        'val/qwk': val_metrics['qwk'],
+        'val/accuracy': val_metrics['accuracy'],
+        'val/loss': val_metrics['loss'],
+        'val/auc_macro': val_metrics['auc_macro'],
+        'val/kappa': val_metrics['kappa'],
+    }
+    for grade in range(num_classes):
+        payload[f'val/recall_grade_{grade}'] = float(recall[grade])
+        payload[f'val/pred_count_grade_{grade}'] = int(pred_counts[grade])
+    map_stats = val_metrics.get('map_stats')
+    if map_stats is not None:
+        n = max(1, map_stats['n'])
+        payload['maps/mean_abs'] = map_stats['mean_abs'] / n
+        payload['maps/frac_pos'] = map_stats['frac_pos'] / n
+    table = wandb.Table(columns=['gt\\pred'] + [str(i) for i in range(num_classes)])
+    for i in range(num_classes):
+        table.add_data(str(i), *[int(v) for v in cm[i]])
+    payload['val/confusion_matrix'] = table
+    run.log(payload, step=epoch)
+
+
+def save_checkpoint(ckpt_path, cfg, model, optimizer, scheduler, epoch,
+                    best_metric, best_epoch, wandb_run_id=None):
+    """Atomically save everything needed to resume as if the run never stopped."""
+    model_to_use = model.module if isinstance(model, nn.DataParallel) else model
+    state = {
+        'epoch': epoch,  # last completed epoch
+        'model': model_to_use.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict() if scheduler is not None else None,
+        'best_metric': best_metric,
+        'best_epoch': best_epoch,
+        'wandb_run_id': wandb_run_id,
+        'config': {
+            'network': cfg.network, 'num_classes': cfg.num_classes, 'img_size': cfg.img_size,
+            'conv_cls': cfg.conv_cls, 'optimizer': cfg.optimizer, 'lr': cfg.lr,
+            'weight_decay': cfg.weight_decay, 'scheduler_name': cfg.scheduler, 'loss': cfg.loss,
+            'label_smoothing': cfg.label_smoothing, 'mixup': cfg.mixup, 'batch_size': cfg.batch_size,
+        },
+        'rng': {
+            'torch': torch.get_rng_state(),
+            'numpy': np.random.get_state(),
+            'python': random.getstate(),
+            'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+    }
+    tmp_path = ckpt_path + '.tmp'
+    torch.save(state, tmp_path)
+    os.replace(tmp_path, ckpt_path)
+    return ckpt_path
+
+
+def load_checkpoint(path, model, optimizer, scheduler, device):
+    """Restore model/optimizer/scheduler and RNG states; returns the raw state dict."""
+    model_to_use = model.module if isinstance(model, nn.DataParallel) else model
+    state = torch.load(path, map_location='cpu', weights_only=False)
+    model_to_use.load_state_dict(state['model'])
+    model_to_use.to(device)
+    if optimizer is not None and state.get('optimizer'):
+        optimizer.load_state_dict(state['optimizer'])
+    if scheduler is not None and state.get('scheduler'):
+        scheduler.load_state_dict(state['scheduler'])
+    rng = state.get('rng') or {}
+    if rng.get('torch') is not None:
+        torch.set_rng_state(rng['torch'])
+    if rng.get('numpy') is not None:
+        np.random.set_state(rng['numpy'])
+    if rng.get('python') is not None:
+        random.setstate(rng['python'])
+    if rng.get('cuda') is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(rng['cuda'])
+        except Exception as exc:
+            print(f'Warning: could not restore CUDA RNG state: {exc}')
+    return state
+
+
+# =============================================================================
 # CONFIG CLASS
 # =============================================================================
 class Config:
@@ -723,6 +840,14 @@ def parse_args():
     parser.add_argument('--log-interval', default=20, type=int)
     parser.add_argument('--generate-heatmaps', action='store_true', default=True)
 
+    # wandb / resume
+    parser.add_argument('--wandb', action='store_true', help='Log per-epoch metrics to Weights & Biases')
+    parser.add_argument('--wandb-project', default='MICCAI', type=str)
+    parser.add_argument('--wandb-entity', default=None, type=str)
+    parser.add_argument('--wandb-run-name', default=None, type=str)
+    parser.add_argument('--resume', default=None, type=str,
+                        help='Resume from a checkpoint: path to checkpoint.pt or its directory')
+
     # Modes
     parser.add_argument('--smoke', action='store_true',
                         help='Sanity run: train on 200 images for 2 epochs')
@@ -774,6 +899,8 @@ def main():
     print(f"Data Dir: {cfg.data_dir}")
     print(f"Train CSV: {cfg.train_csv}, Train Img Dir: {cfg.train_img_dir}")
     print(f"Output: {cfg.save_path}")
+    print(f"wandb: {'on, project ' + args.wandb_project + (f' (entity {args.wandb_entity})' if args.wandb_entity else '') if args.wandb else 'off'}")
+    print(f"Resume: {args.resume or 'no (fresh run)'}")
     import platform
     import torch as _torch
     print(f"Python: {platform.python_version()}, PyTorch: {_torch.__version__}, CUDA: {_torch.version.cuda}")
@@ -871,10 +998,33 @@ def main():
         print('\nDone (tiny-overfit mode; skipping epoch training, heatmaps and submission).')
         return model, save_path
 
-    best_metric = 0.0
-    best_epoch = 0
-    
-    for epoch in range(cfg.epochs):
+    # Resume: restore weights, optimizer, scheduler, best tracking and RNG states
+    resume_state = None
+    start_epoch = 0
+    if args.resume:
+        resume_path = args.resume
+        if os.path.isdir(resume_path):
+            resume_path = os.path.join(resume_path, 'checkpoint.pt')
+        if not os.path.isfile(resume_path):
+            raise SystemExit(f'Resume checkpoint not found: {resume_path}')
+        resume_state = load_checkpoint(resume_path, model, optimizer, scheduler, cfg.device)
+        start_epoch = resume_state['epoch'] + 1
+        best_metric = resume_state.get('best_metric', 0.0)
+        best_epoch = resume_state.get('best_epoch', 0)
+        if resume_state.get('config') and resume_state['config'].get('network') != cfg.network:
+            print(f"WARNING: checkpoint was trained with network {resume_state['config']['network']}, "
+                  f"current --network is {cfg.network}")
+        print(f'Resumed from {resume_path}: continuing at epoch {start_epoch} '
+              f'(best QWK so far {best_metric:.4f} at epoch {best_epoch}). '
+              f'Use the same --seed to reproduce the split.')
+    else:
+        best_metric = 0.0
+        best_epoch = 0
+
+    run = init_wandb(args, resume_state=resume_state)
+    wandb_run_id = run.id if run is not None else None
+
+    for epoch in range(start_epoch, cfg.epochs):
         epoch_start = time.time()
         
         train_metrics = train_epoch(cfg, model, train_loader, optimizer, criterion, epoch)
@@ -914,6 +1064,19 @@ def main():
                 scheduler.step(metric)
             else:
                 scheduler.step()
+
+        # Rolling resume checkpoint + wandb metrics for this epoch
+        ckpt_path = save_checkpoint(
+            os.path.join(save_path, 'checkpoint.pt'), cfg, model, optimizer, scheduler,
+            epoch, best_metric, best_epoch, wandb_run_id=wandb_run_id,
+        )
+        wandb_log_epoch(
+            run, epoch, lr_now, secs, train_metrics['loss'], val_metrics['loss'],
+            train_eval_metrics, val_metrics, cfg.num_classes,
+        )
+
+    if run is not None:
+        run.finish()
     
     print(f'\n{"="*60}')
     print(f'Best validation QWK: {best_metric:.4f} at epoch {best_epoch}')
