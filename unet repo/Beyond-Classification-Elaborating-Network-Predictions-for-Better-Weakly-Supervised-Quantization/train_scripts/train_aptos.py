@@ -22,6 +22,8 @@ from collections import OrderedDict
 from contextlib import suppress
 from functools import partial
 from sklearn.metrics import cohen_kappa_score, confusion_matrix, classification_report
+from sklearn.exceptions import UndefinedMetricWarning
+
 
 import torch
 import torch.distributed as dist
@@ -30,6 +32,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 from torch.utils.data import Dataset, DataLoader, random_split, Subset, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
+import warnings
 
 import torchvision.transforms as T
 from PIL import Image
@@ -41,6 +44,10 @@ from torchmetrics.functional.classification import multiclass_auroc, multiclass_
 # =============================================================================
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root
 from models.model_segrdnet import SegRDNet
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 
 # =============================================================================
