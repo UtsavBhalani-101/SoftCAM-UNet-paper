@@ -44,6 +44,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--softcam-network", default="resnet50")
     parser.add_argument("--output", default="/kaggle/working/softcam_vanilla_baseline")
+    # wandb / resume pass-through
+    parser.add_argument("--wandb", action="store_true", help="Forward wandb logging to the trainer")
+    parser.add_argument("--wandb-project", default=None, type=str)
+    parser.add_argument("--wandb-entity", default=None, type=str)
+    parser.add_argument("--wandb-run-name", default=None, type=str)
+    parser.add_argument("--resume", default=None, type=str,
+                        help="Resume the trainer from checkpoint.pt: file path or its directory")
     return parser.parse_args()
 
 
@@ -128,6 +135,14 @@ def main() -> int:
         "--batch-size", str(softcam_batch_size),
         "--output", str(Path(args.output) / "softcam"),
     ]
+    if args.resume:
+        command.extend(["--resume", args.resume])
+    if args.wandb:
+        command.extend(["--wandb", "--wandb-project", args.wandb_project])
+        if args.wandb_entity:
+            command.extend(["--wandb-entity", args.wandb_entity])
+        if args.wandb_run_name:
+            command.extend(["--wandb-run-name", args.wandb_run_name])
 
     print("Baseline settings:")
     print("  Model: vanilla SoftCAM (no activation-map L1/L2 penalty)")
@@ -135,6 +150,13 @@ def main() -> int:
     print("  Seed:", args.seed)
     print(f"  Target effective batch size: {args.batch_size}")
     print(f"  GPU count: {gpu_count}; per-GPU batch argument: {softcam_batch_size}")
+    if args.wandb:
+        print(f"  wandb: on, project {args.wandb_project}"
+              + (f" (entity {args.wandb_entity})" if args.wandb_entity else ""))
+    else:
+        print("  wandb: off")
+    if args.resume:
+        print(f"  Resuming from: {args.resume}")
     print(f"  Raw Markdown log: {archive_dir / 'softcam.md'}")
 
     print(f"\n{'=' * 72}\nStarting SoftCAM\n{'=' * 72}")
@@ -146,6 +168,9 @@ def main() -> int:
         summary.write(f"- Seed: {args.seed}\n- Epochs: {args.epochs}\n")
         summary.write(f"- Network: {args.softcam_network}\n")
         summary.write(f"- Target effective batch size: {args.batch_size}\n")
+        summary.write(f"- wandb: {'on, project ' + args.wandb_project if args.wandb else 'off'}\n")
+        if args.resume:
+            summary.write(f"- Resumed from: {args.resume}\n")
         summary.write("- SoftCAM map regularization: disabled (vanilla)\n\n")
         summary.write("| Model | Exit code | Best validation QWK | Raw output |\n")
         summary.write("|---|---:|---:|---|\n")
