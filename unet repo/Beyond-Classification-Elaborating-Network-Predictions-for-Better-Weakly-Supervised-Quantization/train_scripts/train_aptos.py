@@ -166,6 +166,8 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
     ce_losses_m = 0.0
     aux_losses_m = 0.0
     reg_losses_m = 0.0
+    ds_losses_m = 0.0
+    mse_losses_m = 0.0
     num_batches = 0
 
     model.train()
@@ -193,11 +195,23 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
                 ce_loss = loss_fn(output, target)
                 softcam_aux_loss = loss_fn(scale_logits[-1], target)
                 loss = ce_loss + cfg.softcam_aux_weight * softcam_aux_loss
+                ds_losses = None
+                mse_losses = None
             else:
-                output = model(input)
+                # Paper stage-2 objective (train_scripts/train_stage_2.py):
+                # CE on the final logits plus deep supervision on all four
+                # decoder scales with halving weights, plus weighted
+                # cross-scale MSE consistency over the evidence maps.
+                output, mse_list, l_list = model(input, eval_mode=False)
                 ce_loss = loss_fn(output, target)
                 softcam_aux_loss = None
-                loss = ce_loss
+                ds_weights = (0.5, 0.25, 0.125, 0.0625)
+                mse_weights = (0.5, 0.25, 0.125)
+                loss = ce_loss \
+                    + sum(w * loss_fn(l, target) for w, l in zip(ds_weights, l_list)) \
+                    + sum(w * m for w, m in zip(mse_weights, mse_list))
+                mse_losses = torch.stack([w * m for w, m in zip(mse_weights, mse_list)]).sum()
+                ds_losses = torch.stack([w * loss_fn(l, target) for w, l in zip(ds_weights, l_list)]).sum()
             
             # Add SoftCAM regularization loss (L1/L2 on evidence maps)
             softcam_reg = None
@@ -211,6 +225,9 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
             aux_losses_m += cfg.softcam_aux_weight * softcam_aux_loss.item()
         if softcam_reg is not None:
             reg_losses_m += float(softcam_reg)
+        if ds_losses is not None:
+            ds_losses_m += float(ds_losses)
+            mse_losses_m += float(mse_losses)
         
         # Scale loss for gradient accumulation
         loss = loss / grad_accum_steps
@@ -272,12 +289,20 @@ def train_one_epoch(epoch, model, loader, optimizer, loss_fn, cfg, device,
     
     if getattr(cfg, 'is_main', True):
         nb = max(1, num_batches)
-        terms = [f'ce={ce_losses_m / nb:.4f}']
-        if cfg.use_softcam_decoder0:
-            terms.append(f'softcam-aux={aux_losses_m / nb:.4f}')
-        if reg_losses_m:
-            terms.append(f'softcam-reg={reg_losses_m / nb:.4f}')
-        print(f"  Train: Loss={metrics['loss']:.4f} ({', '.join(terms)}), "
+        breakdown = ''
+        if cfg.smoke or cfg.tiny_overfit or cfg.use_softcam_decoder0 or reg_losses_m:
+            # Loss decomposition is dev-mode output; full runs print the
+            # original baseline format without the parenthetical.
+            terms = [f'ce={ce_losses_m / nb:.4f}']
+            if cfg.use_softcam_decoder0:
+                terms.append(f'softcam-aux={aux_losses_m / nb:.4f}')
+            if reg_losses_m:
+                terms.append(f'softcam-reg={reg_losses_m / nb:.4f}')
+            if num_batches and ds_losses_m:
+                terms.append(f'deep-sup={ds_losses_m / nb:.4f}')
+                terms.append(f'mse={mse_losses_m / nb:.4f}')
+            breakdown = f" ({', '.join(terms)})"
+        print(f"  Train: Loss={metrics['loss']:.4f}{breakdown}, "
               f"QWK={metrics['qwk']:.4f}, Acc={metrics['accuracy']:.4f}, AUC={metrics['auc_macro']:.4f}")
         print(f"  AUC per class: {metrics['auc_per_class']}")
     
@@ -323,11 +348,13 @@ def validate(model, loader, loss_fn, cfg, device, amp_autocast=suppress):
         print(f"  Valid: Loss={metrics['loss']:.4f}, QWK={metrics['qwk']:.4f}, Acc={metrics['accuracy']:.4f}, AUC={metrics['auc_macro']:.4f}, Kappa={metrics['kappa']:.4f}")
         print(f"  AUC per class: {metrics['auc_per_class']}")
         print(f"  Acc per class: {metrics['accuracy_per_class']}")
-        pred_counts = np.bincount(metrics['pred_labels'], minlength=cfg.num_classes)
-        print(f"  Val images predicted per class: {pred_counts.tolist()}")
-        for grade in range(cfg.num_classes):
-            if pred_counts[grade] == 0:
-                print(f'  WARNING: grade {grade} never predicted')
+        if cfg.smoke or cfg.tiny_overfit:
+            # Dev-mode diagnostics; full runs print the original baseline format
+            pred_counts = np.bincount(metrics['pred_labels'], minlength=cfg.num_classes)
+            print(f"  Val images predicted per class: {pred_counts.tolist()}")
+            for grade in range(cfg.num_classes):
+                if pred_counts[grade] == 0:
+                    print(f'  WARNING: grade {grade} never predicted')
         print(f"  Confusion Matrix:\n{metrics['confusion_matrix']}")
     
     return metrics
@@ -562,6 +589,7 @@ class Config:
         self.smoke = getattr(args, 'smoke', False)
         self.tiny_overfit = getattr(args, 'tiny_overfit', False)
         self.tiny_overfit_steps = getattr(args, 'tiny_overfit_steps', 50)
+        self.save_checkpoints = not getattr(args, 'no_checkpoint', False)
         
         # Output
         self.save_path = args.output
@@ -818,6 +846,8 @@ def parse_args():
     
     # wandb / resume
     parser.add_argument('--wandb', action='store_true', help='Log per-epoch metrics to Weights & Biases')
+    parser.add_argument('--no-checkpoint', action='store_true', default=False,
+                        help='Do not write the rolling checkpoint.pt (wandb + best_model.pth only)')
     parser.add_argument('--wandb-project', default='MICCAI', type=str)
     parser.add_argument('--wandb-entity', default=None, type=str)
     parser.add_argument('--wandb-run-name', default=None, type=str)
@@ -862,7 +892,10 @@ def main():
     print(f"Seed: {args.seed}")
     print(f"Batch Size: {cfg.batch_size}/GPU (effective: {cfg.batch_size * cfg.grad_accum_steps * cfg.world_size} with grad_accum={cfg.grad_accum_steps}, world={cfg.world_size})")
     print(f"Workers: {cfg.num_workers} (persistent: {cfg.persistent_workers})")
-    print(f"Loss: CrossEntropy (label_smoothing={cfg.label_smoothing})")
+    print(f"Loss: CrossEntropy (label_smoothing={cfg.label_smoothing}) + deep supervision "
+          f"0.5/0.25/0.125/0.0625 + MSE 0.5/0.25/0.125 (paper stage-2 objective)")
+    print(f"Pooling: {cfg.pooling}")
+    print(f"Rolling checkpoint.pt: {'saved' if cfg.save_checkpoints else 'DISABLED (--no-checkpoint; wandb + best_model.pth only)'}")
     
     # Option A: SoftCAM Decoder 0
     if cfg.use_softcam_decoder0:
@@ -1080,10 +1113,11 @@ def main():
         lr_now = optimizer.param_groups[0]['lr']
         secs = time.time() - epoch_start
         if cfg.is_main:
-            save_checkpoint(
-                os.path.join(save_path, 'checkpoint.pt'), args, model, optimizer, scheduler,
-                epoch, best_metric, best_epoch, wandb_run_id=wandb_run_id,
-            )
+            if cfg.save_checkpoints:
+                save_checkpoint(
+                    os.path.join(save_path, 'checkpoint.pt'), args, model, optimizer, scheduler,
+                    epoch, best_metric, best_epoch, wandb_run_id=wandb_run_id,
+                )
             wandb_log_epoch(
                 run, epoch, lr_now, secs, train_metrics['loss'], val_metrics['loss'],
                 train_metrics, val_metrics, cfg.num_classes,

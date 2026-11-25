@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32, help="Target effective batch size (grad accumulation)")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--img-size", type=int, default=512)
+    parser.add_argument("--pooling", default="lse", choices=["lse", "avg"], type=str,
+                        help="Spatial pooling of the evidence maps forwarded to the trainer")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default="/kaggle/working/segrdnet_baseline")
     parser.add_argument("--no-multi-gpu", action="store_true",
@@ -146,6 +148,7 @@ def main() -> int:
         "--epochs", str(args.epochs),
         "--workers", str(args.workers),
         "--img-size", str(args.img_size),
+        "--pooling", str(args.pooling),
         "--seed", str(args.seed),
         "--batch-size", str(args.batch_size),
         "--output", str(Path(args.output) / "segrdnet"),
@@ -154,6 +157,10 @@ def main() -> int:
         command.extend(["--resume", args.resume])
     if args.smoke:
         command.append("--smoke")
+    # wandb is the only monitoring; no rolling checkpoint.pt is written.
+    # best_model.pth is still saved - the final evaluation and the
+    # explanation visualizations both load it.
+    command.append("--no-checkpoint")
     if args.tiny_overfit:
         command.extend(["--tiny-overfit", "--tiny-overfit-steps", str(args.tiny_overfit_steps)])
     if args.wandb:
@@ -167,11 +174,13 @@ def main() -> int:
 
     print("Baseline settings:")
     print("  Model: SegRDNet (UNet) baseline, SoftCAM Decoder 0 head disabled")
+    print(f"  Pooling: {args.pooling}")
     print("  Epochs:", args.epochs)
     print("  Seed:", args.seed)
     print(f"  Target effective batch size: {args.batch_size}")
     print(f"  GPU count: {gpu_count}; training "
           + (f"multi-GPU via DDP ({gpu_count} processes)" if use_ddp else "single-GPU"))
+    print("  Rolling checkpoint.pt: disabled (wandb + best_model.pth only)")
     if args.wandb:
         print(f"  wandb: on, project {args.wandb_project}"
               + (f" (entity {args.wandb_entity})" if args.wandb_entity else ""))
@@ -190,6 +199,8 @@ def main() -> int:
     with summary_path.open("w", encoding="utf-8") as summary:
         summary.write("# SegRDNet (UNet) APTOS baseline\n\n")
         summary.write(f"- Seed: {args.seed}\n- Epochs: {args.epochs}\n")
+        summary.write(f"- Pooling: {args.pooling}\n")
+        summary.write(f"- Rolling checkpoint.pt: disabled (wandb + best_model.pth only)\n")
         summary.write(f"- Network: SegRDNet (RDNet Tiny backbone)\n")
         summary.write(f"- Target effective batch size: {args.batch_size}\n")
         summary.write(f"- wandb: {'on, project ' + args.wandb_project if args.wandb else 'off'}\n")
