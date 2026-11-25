@@ -232,8 +232,14 @@ def gradcam_heatmap(model, x, cls):
     # Layer from the heatmap generation: Identity between the per-class bias
     # shift and the log-so-exp reduction inside the final LSE pooling.
     target_layers = [classifier.model.lse3.check]
-    with GradCAM(model=classifier, target_layers=target_layers) as cam:
+    # Not using 'with': BaseCAM.__exit__ swallows IndexError, which masks the
+    # real failure and leaves the CAM result unbound. Call directly, then
+    # release hooks; any error propagates with a full traceback.
+    cam = GradCAM(model=classifier, target_layers=target_layers)
+    try:
         grayscale = cam(input_tensor=x, targets=[SelectedLogitTarget(cls)])
+    finally:
+        cam.activations_and_grads.release()
     return grayscale[0, :].cpu().numpy() if hasattr(grayscale[0, :], 'cpu') else grayscale[0, :]
 
 
