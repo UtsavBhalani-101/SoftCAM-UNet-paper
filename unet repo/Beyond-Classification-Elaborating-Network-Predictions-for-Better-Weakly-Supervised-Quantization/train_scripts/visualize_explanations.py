@@ -281,7 +281,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--lse-checkpoint', required=True, help='best_model.pth or checkpoint.pt of the LSE run')
     ap.add_argument('--avg-checkpoint', default=None,
-                    help='optional AVG-pooling checkpoint to compare against')
+                    help='optional AVG-pooling checkpoint to compare against (must differ from --primary-pooling)')
+    ap.add_argument('--primary-pooling', default='lse', choices=['lse', 'avg'],
+                    help="pooling of the --lse-checkpoint model; set to 'avg' for AVG-only runs")
 
     ap.add_argument('--data-dir', default='/kaggle/input/competitions/aptos2019-blindness-detection')
     ap.add_argument('--img-size', type=int, default=512)
@@ -305,8 +307,8 @@ def main():
     dataset = APTOSDataset(csv_path, os.path.join(args.data_dir, 'train_images'),
                            transform=get_transforms(args.img_size))
 
-    models = {'LSE': load_model('lse', args.lse_checkpoint, device)}
-    if args.avg_checkpoint:
+    models = {args.primary_pooling.upper(): load_model(args.primary_pooling, args.lse_checkpoint, device)}
+    if args.avg_checkpoint and args.avg_checkpoint != args.lse_checkpoint:
         models['AVG'] = load_model('avg', args.avg_checkpoint, device)
 
     print(f'Visualizing {len(picks)} images across {list(models)} ({args.mode}) -> {args.out_dir}')
