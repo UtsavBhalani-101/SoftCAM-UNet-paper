@@ -116,6 +116,7 @@ def capture_maps(model, x):
     """
     maps = {}
     hooks = []
+    x = x.to(next(model.parameters()).device)
     for name in ['fc0', 'fc1', 'fc2', 'fc3']:
         module = getattr(model, name, None)
         if module is None:
@@ -227,12 +228,13 @@ class SelectedLogitTarget:
 def gradcam_heatmap(model, x, cls):
     """Paper-style GradCAM at lse3.check for one class; returns HxW in [0, 1]."""
     classifier = ClassNet(model, cls)
+    x = x.to(next(model.parameters()).device)
     # Layer from the heatmap generation: Identity between the per-class bias
     # shift and the log-so-exp reduction inside the final LSE pooling.
     target_layers = [classifier.model.lse3.check]
     with GradCAM(model=classifier, target_layers=target_layers) as cam:
         grayscale = cam(input_tensor=x, targets=[SelectedLogitTarget(cls)])
-    return grayscale[0, :]
+    return grayscale[0, :].cpu().numpy() if hasattr(grayscale[0, :], 'cpu') else grayscale[0, :]
 
 
 def paper_jet_heatmap(gray, size):
