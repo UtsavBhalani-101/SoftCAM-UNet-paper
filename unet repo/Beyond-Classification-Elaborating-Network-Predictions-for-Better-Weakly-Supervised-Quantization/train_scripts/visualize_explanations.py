@@ -222,7 +222,9 @@ class SelectedLogitTarget:
         self.cls = cls
 
     def __call__(self, model_output):
-        return model_output[:, 0]
+        # ClassNet already selected the class logit, so model_output arrives
+        # as a per-image 0-dim scalar; pass it through unchanged.
+        return model_output.sum()
 
 
 def gradcam_heatmap(model, x, cls):
